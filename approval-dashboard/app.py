@@ -44,6 +44,28 @@ PORT = int(os.environ.get("APPROVAL_PORT", "8765"))
 ADMIN_USER = os.environ.get("APPROVAL_ADMIN_USER", "admin")
 SLOTS = ["AU", "UK", "US", "AFF"]
 SLOT_NAMES = {"AU": "澳洲场", "UK": "英国场", "US": "美国场", "AFF": "Affiliate 场"}
+SLOT_SEND_TIMES = {"AU": "09:37", "UK": "15:37", "US": "20:37", "AFF": "22:37"}
+def scheduled_send_info(pack_date, slot, status, sent):
+    """Return (text, overdue_bool) for an item. Scheduled time is pack_date + slot time, Beijing.
+    Approved-but-unsent past its scheduled time is flagged overdue so the user can tell stuck from waiting."""
+    t = SLOT_SEND_TIMES.get(slot)
+    if not t:
+        return ("预计发送：未设场次，按包日期发送", False)
+    sched = f"{pack_date} {t}"
+    if sent:
+        return (f"已发送（原定 {sched} 北京时间）", False)
+    if status == "approved":
+        try:
+            now = datetime.now(timezone(timedelta(hours=8)))
+            sched_dt = datetime.strptime(sched, "%Y-%m-%d %H:%M").replace(tzinfo=timezone(timedelta(hours=8)))
+            if now > sched_dt:
+                return (f"预计发送：{sched} 北京时间 · 已过预计时间，仍未发送（卡住）", True)
+        except Exception:
+            pass
+        return (f"预计发送：{sched} 北京时间 · {SLOT_NAMES.get(slot, slot)}", False)
+    if status == "pending":
+        return (f"待审批，批后预计 {sched} 北京时间发送", False)
+    return (f"原定 {sched} 北京时间", False)
 KIND_NAMES = {"first": "首联", "followup": "跟进", "affiliate": "Affiliate 招募", "submission": "投稿", "reply": "回信"}
 STATUS_NAMES = {"pending": "待审批", "approved": "已批准", "rejected": "已驳回"}
 
@@ -602,6 +624,16 @@ class H(BaseHTTPRequestHandler):
         for r in emails[:8]:
             cs_v = r["code_status"] if "code_status" in r.keys() else "等待中"
             email_rows += f"<tr><td>{esc(r['email'])}</td><td>{esc(r['provider'])}</td><td>{esc(r['auxiliary_email']) if 'auxiliary_email' in r.keys() and r['auxiliary_email'] else '未填'}</td><td>{esc(cs_v)}</td></tr>"
+        pending_send_rows = ""
+        try:
+            for r in c.execute("SELECT * FROM items WHERE status='approved' AND sent=0 ORDER BY pack_date, slot, id").fetchall():
+                s_txt, overdue = scheduled_send_info(r["pack_date"], r["slot"], r["status"], r["sent"])
+                overdue_html = '<b style="color:#b91c1c">卡住？已过预计时间</b>' if overdue else '等待时段'
+                pending_send_rows += f"<tr><td>{esc(r['outlet'])}</td><td>{esc(slot_name(r['slot']))}</td><td>{esc(s_txt)}</td><td>{overdue_html}</td></tr>"
+        except Exception:
+            pending_send_rows = ""
+        pending_send_rows_html = pending_send_rows or '<tr><td colspan="4">暂无已批准未发送条目</td></tr>'
+        pending_send_card = f"<div class=\"card\"><h2>已批准未发送 · 预计发送时间</h2><p class=\"mut\">批了还没发的都在这里，带预计发送时间；已过预计时间仍未发的标红，就是卡住了，不用猜。</p><table><tr><th>渠道</th><th>场次</th><th>预计发送</th><th>状态</th></tr>{pending_send_rows_html}</table></div>"
         body = f"""<div class="card"><h1>仪表盘首页</h1><p class="mut">审批、邮箱、验证码状态一屏看完。所有数字都来自看板自己的数据库，没有外部销量、订单等数据，不编数。</p>
         <div class="grid">
         <div class="stat"><span class="mut">包总数</span><b>{st['total_packs']}</b></div>
@@ -623,6 +655,7 @@ class H(BaseHTTPRequestHandler):
         </div>
         <div class="card"><h2>验证码监控健康</h2><p class="mut">只监控一个邮箱，其他邮箱显示“未监控”，不是“等待中”，避免看着像假数据。</p><p>监控邮箱：见邮箱仪表盘里“最后检查”最新的一条 · 频率：每 10 分钟 · 没新码时静默，不更新、不发消息 · 会话过期时看板状态会变成“会话已过期”，而不是一直停在旧的“已到达”。</p><p>聊天群：已加入 {len(chat_ais)} 个 AI，消息 {chat_msg_n} 条。<a class="btn primary" href="/chat">打开聊天群问验证码</a> <a class="btn" href="/emails">去邮箱仪表盘</a></p></div>
         <div class="card"><h2>最近包（10 个）</h2><table><tr><th>日期</th><th>包状态</th><th>条目</th><th>已批准</th><th>待审批</th><th>已发送</th></tr>{pack_rows or '<tr><td colspan="6">暂无包</td></tr>'}</table></div>
+        {pending_send_card}
         <div class="card"><h2>邮箱一览（前 8 个）</h2><table><tr><th>邮箱</th><th>服务商</th><th>辅助邮箱</th><th>验证码状态</th></tr>{email_rows or '<tr><td colspan="4">暂无邮箱</td></tr>'}</table><p><a href="/emails">打开邮箱仪表盘，做搜索、批量、增删改查</a></p></div>"""
         return self.send_html(page("仪表盘首页", user, body))
 
@@ -777,7 +810,7 @@ class H(BaseHTTPRequestHandler):
             <p><a class="btn primary" href="/packs/{esc(r['pack_date'])}">打开包详情批</a> <a class="btn" href="/packs/{esc(r['pack_date'])}?category={esc(item_category(r))}">同分类筛选</a></p>
             <form method="post" action="/packs/{esc(r['pack_date'])}/decide"><input type="hidden" name="csrf" value="{csrf}">
             <button class="btn" name="single_action" value="approve:{r['id']}">批准本条并立即发送</button></form>
-            <p class="mut">批准即直接授权发送：点“批准本条并立即发送”后监控任务会在 5 分钟内发出，不用再点立即发送。</p></div>"""
+            <p class="mut">批准即直接授权发送：点“批准本条并立即发送”后，条目按场次时间发送（见包详情里的预计发送时间），不用再点立即发送。</p></div>"""
         body = f"""<div class="card"><h1>待办</h1><p class="mut">只列需要你动手的事：待审批的，和已批准但还没发的。立即发送的排最前面。点“打开包详情批”就能批、标记立即发送，不用在列表里翻。待办页上也可以直接点“标记本条为立即发送”或“批准本条并立即发送”。</p></div>
         {cards or '<div class="card"><p>没有待办，全部已处理。</p></div>'}"""
         html = page("待办", user, body)
@@ -993,11 +1026,13 @@ curl https://approve.example.com/api/emails/stats -H "Authorization: Bearer &lt;
             if r["commitment"]: flags.append("含承诺 · 需单独批")
             flag_html = "".join(f"<span class='badge warn'>{esc(f)}</span>" for f in flags) or "<span class='badge mut'>无特殊旗标</span>"
             status_badge = "ok" if r["status"] == "approved" else ("bad" if r["status"] == "rejected" else "mut")
+            sched_txt, sched_overdue = scheduled_send_info(date, r["slot"], r["status"], r["sent"])
             cards += f"""<div class="item" data-slot="{esc(r['slot'])}" data-eligible="{'1' if (r['status']=='pending' and not r['yellow'] and not r['commitment']) else '0'}">
             <label><input type="checkbox" name="item_ids" value="{r['id']}" class="item-check" data-slot="{esc(r['slot'])}"> 选择</label>
             <h3>{esc(r['outlet'])}</h3>
             <p class="mut">{esc(r['recipient'])} <button type="button" class="btn" onclick="copyText(this, '{esc(r['recipient'])}')">复制邮箱</button> · {slot_name(r['slot'])} · {kind_name(r['kind'])} · 主题：{esc(r['subject'])}</p>
             <p><span class="badge {status_badge}">{status_name(r['status'])}</span><span class="badge">{'已发送' if r['sent'] else '未发送'}</span>{'<span class="badge big bad">立即发送</span>' if (r['send_now'] if 'send_now' in r.keys() else 0) and not r['sent'] else ''}<span class="badge">分类：{esc(item_category(r))}</span><span class="badge">分组：{esc(item_group(r))}</span>{flag_html}</p>
+            <p><b>{esc(sched_txt)}</b></p>
             <p class="mut">动作类型：{esc(r['action_type'] if 'action_type' in r.keys() else 'send_email')}{(' · 旗标原因：' + esc(r['flag_reason'])) if (r['flag_reason'] if 'flag_reason' in r.keys() else '') else ''}</p>
             <div class="tabs"><button type="button" class="tab on" onclick="showLang(this,'en-{r['id']}')">英文原文</button>
             <button type="button" class="tab" onclick="showLang(this,'zh-{r['id']}')">全文中文译版</button></div>
@@ -1036,7 +1071,7 @@ document.addEventListener('change',function(e){if(e.target.classList.contains('i
             banner = f"<div class='banner approved'>已批准 {cnt['approved']} 条 · 未发送 {cnt['total'] - cnt['sent']} 条</div>"
         else:
             banner = f"<div class='banner pending'>待审批 {cnt['pending']} 条</div>"
-        body = f"""<div class="card"><h1>包 {esc(date)}</h1>{banner}<p class="mut">批准即直接授权发送：点批准后监控任务会在 5 分钟内发出，不用再点立即发送。</p><p class="mut">包状态：{esc(pack['status'])} · 条目 {cnt['total']} · 已批准 {cnt['approved']} · 待审批 {cnt['pending']} · 已驳回 {cnt['rejected']} · 已发送 {cnt['sent']} · 立即发送 {cnt['send_now']} · {slot_summary}</p>
+        body = f"""<div class="card"><h1>包 {esc(date)}</h1>{banner}<p class="mut">批准即直接授权发送。已批准条目按场次时间发送（北京时间，包日期当天）：澳洲 09:37 / 英国 15:37 / 美国 20:37 / Affiliate 22:37；已过预计时间仍未发的条目会标红，就是卡住了。</p><p class="mut">包状态：{esc(pack['status'])} · 条目 {cnt['total']} · 已批准 {cnt['approved']} · 待审批 {cnt['pending']} · 已驳回 {cnt['rejected']} · 已发送 {cnt['sent']} · 立即发送 {cnt['send_now']} · {slot_summary}</p>
         <p><a href="/packs/{esc(date)}/export.csv">导出本包 CSV</a> · <a href="/packs/{esc(date)}/export.csv?approved=1">仅导出已批准</a> · <a href="/packs">返回包列表</a> · <a href="/todo">待办页</a> · <a href="/api-docs">接口文档</a></p><form method="post" action="/packs/{esc(date)}/decide" onsubmit="return confirm('一键批准并立即发送本包全部待审批吗？亮黄/承诺项未勾确认会被跳过。')"><input type="hidden" name="csrf" value="{csrf}">{''.join(f'<input type="hidden" name="item_ids" value="{r["id"]}">' for r in rows if r["status"]=="pending")}<button class="btn primary" name="action" value="approve">一键批准并立即发送本包全部待审批</button></form><p>按场次快速筛：{slot_chips} <a class="btn" href="/packs/{esc(date)}">全部场次</a></p><p><button type="button" class="btn" onclick="expandAll(true)">全部展开中文</button> <button type="button" class="btn" onclick="expandAll(false)">全部收回英文</button> <span class="mut">可直接批：{eligible_n} 条</span></p>{msg_html}{filter_form}</div>
         <form method="post" action="/packs/{esc(date)}/decide" onsubmit="return countSel()"><input type="hidden" name="csrf" value="{csrf}">
         <div class="sticky"><b>已选 <span id="selcount">0</span> 条</b>
@@ -1411,7 +1446,7 @@ document.addEventListener('change',function(e){if(e.target.classList.contains('i
             elif not done and not errors:
                 msg = "未选任何条目，请先勾选要处理的条目再点按钮"
             elif action == "approve" and done:
-                msg = f"已批准并授权立即发送 {len(done)} 条，监控任务会在 5 分钟内发出，不用再点立即发送" + (f"，跳过 {len(errors)} 条：{errors[0]}" if errors else "")
+                msg = f"已批准并授权发送 {len(done)} 条，按场次时间发送（见包详情里的预计发送时间），不用再点立即发送" + (f"，跳过 {len(errors)} 条：{errors[0]}" if errors else "")
             else:
                 msg = f"已处理 {len(done)} 条" + (f"，跳过 {len(errors)} 条：{errors[0]}" if errors else "")
             self.send_response(302); self.send_header("Location", f"/packs/{date}?msg=" + _up.quote(msg)); self.end_headers(); return
