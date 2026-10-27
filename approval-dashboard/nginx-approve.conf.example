@@ -1,0 +1,11 @@
+# 宝塔新站 extension 目录示例：只给 approve.example.com 加反代
+# 文件位置示例：/www/server/panel/vhost/nginx/approve.example.com.conf 的 extension 目录下 proxy.conf
+# 绝不动主站 example.com 的配置。
+location / {
+    proxy_pass http://127.0.0.1:8765;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_http_version 1.1;
+}
