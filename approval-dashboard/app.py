@@ -42,31 +42,53 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 DB = os.environ.get("APPROVAL_DB", os.path.join(BASE, "data.db"))
 PORT = int(os.environ.get("APPROVAL_PORT", "8765"))
 ADMIN_USER = os.environ.get("APPROVAL_ADMIN_USER", "admin")
-SLOTS = ["AU", "UK", "US", "AFF"]
-SLOT_NAMES = {"AU": "澳洲场", "UK": "英国场", "US": "美国场", "AFF": "Affiliate 场"}
-SLOT_SEND_TIMES = {"AU": "09:37", "UK": "15:37", "US": "20:37", "AFF": "22:37"}
+# Generic package: no fixed slot times and no fixed slot names.
+# If your own task has fixed slots, fill SLOT_SEND_TIMES with your own
+# slot codes and HH:MM times; otherwise a scheduled time is not shown
+# and an approved-but-unsent item is flagged abnormal only after its
+# pack date has passed. Do not copy another task's slot times here.
+SLOT_SEND_TIMES = {}
 def scheduled_send_info(pack_date, slot, status, sent):
-    """Return (text, overdue_bool) for an item. Scheduled time is pack_date + slot time, Beijing.
-    Approved-but-unsent past its scheduled time is flagged overdue so the user can tell stuck from waiting."""
+    """Return (text, overdue_bool) for an item, generic version.
+
+    If SLOT_SEND_TIMES has a time for this slot, that time on the pack
+    date is the scheduled time. Otherwise there is no fixed slot time:
+    an approved-but-unsent item is flagged abnormal only once its pack
+    date has passed, so a reader can tell waiting from stuck without
+    assuming any other task's schedule.
+    """
     t = SLOT_SEND_TIMES.get(slot)
-    if not t:
-        return ("预计发送：未设场次，按包日期发送", False)
-    sched = f"{pack_date} {t}"
+    if t:
+        sched = f"{pack_date} {t}"
+        if sent:
+            return (f"已发送（原定 {sched}）", False)
+        if status == "approved":
+            try:
+                now = datetime.now(timezone(timedelta(hours=8)))
+                sched_dt = datetime.strptime(sched, "%Y-%m-%d %H:%M").replace(tzinfo=timezone(timedelta(hours=8)))
+                if now > sched_dt:
+                    return (f"预计发送：{sched} · 异常：已过预计时间，仍未发送", True)
+            except Exception:
+                pass
+            return (f"预计发送：{sched}", False)
+        if status == "pending":
+            return (f"待审批，批后预计 {sched} 发送", False)
+        return (f"原定 {sched}", False)
     if sent:
-        return (f"已发送（原定 {sched} 北京时间）", False)
+        return (f"已发送（包日期 {pack_date}）", False)
     if status == "approved":
         try:
-            now = datetime.now(timezone(timedelta(hours=8)))
-            sched_dt = datetime.strptime(sched, "%Y-%m-%d %H:%M").replace(tzinfo=timezone(timedelta(hours=8)))
-            if now > sched_dt:
-                return (f"预计发送：{sched} 北京时间 · 已过预计时间，仍未发送（卡住）", True)
+            today = datetime.now().date().isoformat()
+            if pack_date and pack_date < today:
+                return (f"已批准未发 · 异常：包日期 {pack_date} 已过，仍未发送", True)
         except Exception:
             pass
-        return (f"预计发送：{sched} 北京时间 · {SLOT_NAMES.get(slot, slot)}", False)
+        return ("已批准未发，等待执行（未设固定场次时间）", False)
     if status == "pending":
-        return (f"待审批，批后预计 {sched} 北京时间发送", False)
-    return (f"原定 {sched} 北京时间", False)
-KIND_NAMES = {"first": "首联", "followup": "跟进", "affiliate": "Affiliate 招募", "submission": "投稿", "reply": "回信"}
+        return ("待审批，批后等待执行", False)
+    return (f"包日期 {pack_date}", False)
+
+KIND_NAMES = {"first": "首次联系", "followup": "跟进", "affiliate": "合作邀请", "submission": "投稿", "reply": "回信"}
 STATUS_NAMES = {"pending": "待审批", "approved": "已批准", "rejected": "已驳回"}
 
 def now_iso():
@@ -98,6 +120,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS chat_accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, ai_name TEXT UNIQUE, identity TEXT, token_hash TEXT, created_at TEXT, mailbox TEXT);
     CREATE TABLE IF NOT EXISTS chat_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT, kind TEXT DEFAULT 'message', body TEXT, created_at TEXT);
     CREATE TABLE IF NOT EXISTS email_accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT, email TEXT, purpose TEXT, status TEXT DEFAULT 'registered', created_at TEXT, password TEXT DEFAULT '', auxiliary_email TEXT DEFAULT '', code_status TEXT DEFAULT '等待中', code_last_checked_at TEXT DEFAULT '', code_last_email_at TEXT DEFAULT '', code_last_email_from TEXT DEFAULT '', code_last_email_subject TEXT DEFAULT '');
+    CREATE TABLE IF NOT EXISTS git_sync_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, status TEXT DEFAULT 'pending', requested_at TEXT, finished_at TEXT, result TEXT DEFAULT '');
     CREATE TABLE IF NOT EXISTS audit (
       id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, username TEXT,
       action TEXT, item_id INTEGER, detail TEXT);
@@ -111,7 +134,7 @@ def init_db():
                          ("send_now", "INTEGER DEFAULT 0")]:
             if col not in cols:
                 c.execute(f"ALTER TABLE items ADD COLUMN {col} {ddl}")
-        c.execute("UPDATE items SET category=CASE WHEN slot='AFF' THEN '联盟招募' ELSE '官媒建联' END WHERE category IS NULL OR category=''")
+        c.execute("UPDATE items SET category=CASE WHEN slot='AFF' THEN '合作邀请' ELSE '正常审批' END WHERE category IS NULL OR category=''")
         c.execute("UPDATE items SET group_name=slot WHERE group_name IS NULL OR group_name=''")
         c.execute("UPDATE items SET action_type='send_email' WHERE action_type IS NULL OR action_type=''")
         c.commit()
@@ -182,12 +205,14 @@ def chat_account_for_token(tok):
     return dict(row) if row else None
 
 def canon_sender(x):
-    m = {"main-assistant": "小P", "main": "小P"}
+    m = {"main-assistant": "AI助手", "main": "AI助手"}
     return m.get(x, x)
 
 def sender_label(x):
     cx = canon_sender(x)
-    return "小P（iCarsoft 工作人员）" if cx == "小P" else cx
+    if cx == ADMIN_USER:
+        return ADMIN_USER + "（超级管理员）"
+    return "AI助手（通用业务 工作人员）" if cx == "AI助手" else cx
 
 def esc(s):
     return html.escape(str(s or ""))
@@ -199,7 +224,7 @@ def item_category(r):
         v = ""
     if v:
         return v
-    return "联盟招募" if r["slot"] == "AFF" else "官媒建联"
+    return "合作邀请" if r["slot"] == "AFF" else "正常审批"
 def item_group(r):
     try:
         v = r["group_name"]
@@ -207,7 +232,7 @@ def item_group(r):
         v = ""
     return v or r["slot"] or ""
 def slot_name(s):
-    return SLOT_NAMES.get(s, s or "")
+    return s or ""
 def kind_name(k):
     return KIND_NAMES.get(k, k or "")
 def status_name(s):
@@ -290,42 +315,47 @@ def stats_data():
     }
 
 CSS = """
-:root{--bg:#f3f5f9;--card:#fff;--ink:#1a2433;--mut:#667085;--line:#e2e8f0;--brand:#1f4ed8;--brand2:#0e7490;--ok:#15803d;--warn:#b45309;--bad:#b91c1c;--soft:#eef2ff}
-*{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--ink);line-height:1.6}
+:root{--bg:#f6f7fb;--card:#ffffff;--ink:#111827;--mut:#6b7280;--line:#e5e7eb;--brand:#2563eb;--brand-dark:#1d4ed8;--brand-soft:#eff6ff;--ok:#15803d;--ok-soft:#dcfce7;--warn:#b45309;--warn-soft:#fef3c7;--bad:#dc2626;--bad-soft:#fee2e2;--radius:16px;--shadow:0 1px 2px rgba(16,24,40,.05),0 4px 16px rgba(16,24,40,.06)}
+*{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--ink);line-height:1.6;-webkit-font-smoothing:antialiased}
 a{color:var(--brand);text-decoration:none}a:hover{text-decoration:underline}
-.top{background:#0f172a;color:#fff;padding:14px 20px;display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between}
-.top b{font-size:18px}.top nav{display:flex;gap:14px;flex-wrap:wrap}.top nav a{color:#cbd5e1}.top nav a:hover{color:#fff}
-.wrap{max-width:1100px;margin:0 auto;padding:20px 16px 80px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px;margin:14px 0;box-shadow:0 1px 3px rgba(0,0,0,.06)}
-h1{font-size:22px;margin:6px 0 10px}h2{font-size:18px;margin:18px 0 10px}h3{font-size:15px;margin:12px 0 6px}
-.mut{color:var(--mut);font-size:13px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}
-.stat{border:1px solid var(--line);border-radius:12px;padding:14px;background:#fff}.stat b{font-size:26px;display:block}
-.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;background:var(--soft);color:var(--brand);margin-right:6px}
+.top{background:#0f172a;color:#fff;padding:14px 20px;display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:50;box-shadow:0 2px 12px rgba(0,0,0,.18)}
+.top b{font-size:18px;letter-spacing:.2px}.top nav{display:flex;gap:6px;flex-wrap:wrap;align-items:center}.top nav a{color:#cbd5e1;padding:6px 10px;border-radius:999px}.top nav a:hover{color:#fff;background:rgba(255,255,255,.12);text-decoration:none}
+.wrap{max-width:1120px;margin:0 auto;padding:24px 16px 96px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:20px;margin:16px 0;box-shadow:var(--shadow)}
+h1{font-size:24px;margin:4px 0 8px;letter-spacing:-.3px;line-height:1.3}h2{font-size:18px;margin:20px 0 10px;letter-spacing:-.2px}h3{font-size:15px;margin:12px 0 6px}
+.mut{color:var(--mut);font-size:13px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px}
+.stat{border:1px solid var(--line);border-radius:14px;padding:16px;background:#fff;box-shadow:var(--shadow)}.stat b{font-size:28px;display:block;line-height:1.2}.stat .mut{font-size:12px;text-transform:uppercase;letter-spacing:.4px}
+.badge{display:inline-block;padding:3px 9px;border-radius:999px;font-size:12px;font-weight:600;background:var(--brand-soft);color:var(--brand);margin-right:6px}
 .badge.big{font-size:16px;padding:6px 14px;font-weight:700}
-.banner{border-radius:14px;padding:16px;margin:14px 0;font-size:18px;font-weight:700}
-.banner.sendnow{background:#fee2e2;color:#991b1b;border:2px solid #fca5a5}
-.banner.approved{background:#dcfce7;color:#166534;border:2px solid #86efac}
-.banner.pending{background:#fef3c7;color:#92400e;border:2px solid #fde68a}
-.badge.ok{background:#dcfce7;color:var(--ok)}.badge.bad{background:#fee2e2;color:var(--bad)}.badge.warn{background:#fef3c7;color:var(--warn)}.badge.mut{background:#f1f5f9;color:var(--mut)}
-.btn{display:inline-block;border:1px solid var(--line);background:#fff;color:var(--ink);padding:8px 14px;border-radius:9px;cursor:pointer;font-size:14px}
-.btn:hover{border-color:var(--brand)}.btn.primary{background:var(--brand);color:#fff;border-color:var(--brand)}.btn.danger{color:var(--bad);border-color:#fecaca}
-input,select,textarea{padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:14px;width:100%}
-input[type=checkbox]{width:auto}form.inline{display:flex;gap:8px;flex-wrap:wrap;align-items:end}form.inline label{font-size:13px;color:var(--mut)}
-table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:9px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
-th{color:var(--mut);font-size:12px;white-space:nowrap}
-.item{border:1px solid var(--line);border-radius:12px;padding:14px;margin:12px 0}.item h3{margin:0 0 6px}
-pre{white-space:pre-wrap;word-break:break-word;background:#f8fafc;border:1px solid var(--line);border-radius:8px;padding:12px;font-size:13px;max-height:320px;overflow:auto}
-.tabs{display:flex;gap:8px;margin:10px 0}.tab{padding:6px 12px;border-radius:999px;border:1px solid var(--line);background:#fff;cursor:pointer}.tab.on{background:var(--brand);color:#fff;border-color:var(--brand)}
+.banner{border-radius:14px;padding:16px 18px;margin:14px 0;font-size:17px;font-weight:700;border-left:5px solid var(--line)}
+.banner.sendnow{background:var(--bad-soft);color:#991b1b;border-color:#fca5a5}
+.banner.approved{background:var(--ok-soft);color:#166534;border-color:#86efac}
+.banner.pending{background:var(--warn-soft);color:#92400e;border-color:#fde68a}
+.badge.ok{background:var(--ok-soft);color:var(--ok)}.badge.bad{background:var(--bad-soft);color:var(--bad)}.badge.warn{background:var(--warn-soft);color:var(--warn)}.badge.mut{background:#f1f5f9;color:var(--mut)}
+.btn{display:inline-block;border:1px solid var(--line);background:#fff;color:var(--ink);padding:10px 16px;border-radius:10px;cursor:pointer;font-size:14px;font-weight:600;transition:all .15s ease}
+.btn:hover{border-color:var(--brand);transform:translateY(-1px);box-shadow:0 2px 8px rgba(37,99,235,.15)}.btn:active{transform:translateY(0)}
+.btn.primary{background:linear-gradient(180deg,#2563eb,#1d4ed8);color:#fff;border-color:var(--brand-dark);box-shadow:0 2px 8px rgba(37,99,235,.3)}
+.btn.danger{color:var(--bad);border-color:#fecaca}
+input,select,textarea{padding:10px 12px;border:1px solid var(--line);border-radius:10px;font-size:14px;width:100%;background:#fff}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--brand);box-shadow:0 0 0 3px rgba(37,99,235,.15)}
+input[type=checkbox]{width:auto;accent-color:var(--brand)}form.inline{display:flex;gap:10px;flex-wrap:wrap;align-items:end}form.inline label{font-size:13px;color:var(--mut)}
+table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:10px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{color:var(--mut);font-size:12px;white-space:nowrap;text-transform:uppercase;letter-spacing:.4px}
+.item{border:1px solid var(--line);border-radius:14px;padding:16px;margin:14px 0;background:#fff;transition:box-shadow .15s ease}.item:hover{box-shadow:var(--shadow)}.item h3{margin:0 0 6px}
+pre{white-space:pre-wrap;word-break:break-word;background:#f8fafc;border:1px solid var(--line);border-radius:10px;padding:14px;font-size:13px;max-height:320px;overflow:auto}
+.tabs{display:flex;gap:8px;margin:10px 0;flex-wrap:wrap}.tab{padding:7px 14px;border-radius:999px;border:1px solid var(--line);background:#fff;cursor:pointer;font-weight:600}.tab.on{background:var(--brand);color:#fff;border-color:var(--brand)}
 .bar{height:10px;background:#e2e8f0;border-radius:999px;overflow:hidden}.bar i{display:block;height:100%;background:var(--brand)}
-.sticky{position:sticky;bottom:0;background:#fff;border:1px solid var(--line);border-radius:12px;padding:12px;margin:16px 0;box-shadow:0 -4px 20px rgba(0,0,0,.08);display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.sticky{position:sticky;bottom:12px;background:#fff;border:1px solid var(--line);border-radius:14px;padding:14px;margin:16px 0;box-shadow:0 8px 28px rgba(0,0,0,.12);display:flex;gap:10px;flex-wrap:wrap;align-items:center;z-index:40}
 code{background:#f1f5f9;padding:2px 6px;border-radius:6px;font-size:13px}pre code{background:none;padding:0}
-@media(max-width:720px){.top{padding:12px}.wrap{padding:14px 10px 80px}table{font-size:13px}th,td{padding:7px 5px}}
+.hero{background:linear-gradient(135deg,#0f172a,#1d4ed8);color:#fff;border:none}.hero h1{color:#fff}.hero .mut{color:#cbd5e1}.hero .btn.primary{background:#fff;color:#1d4ed8;border-color:#fff}.cols{display:grid;grid-template-columns:1fr 1fr;gap:14px}@media(max-width:720px){.cols{grid-template-columns:1fr}}
+.chatbox{height:55vh;min-height:320px;overflow-y:auto;display:flex;flex-direction:column;gap:10px;padding:16px;background:#eef2f7;border:1px solid var(--line);border-radius:16px}.msg{max-width:78%;padding:10px 14px;border-radius:16px;background:#fff;box-shadow:var(--shadow);word-break:break-word}.msg.mine{align-self:flex-end;background:#1d4ed8;color:#fff}.msg.mine .mut{color:#cbd5e1}.msg.admin{border:2px solid #f59e0b}.msg .who{font-size:13px;font-weight:700;margin-bottom:4px}.msg .when{font-size:12px;font-weight:400}.chat-input{display:flex;gap:10px;align-items:flex-end;margin-top:12px}.chat-input textarea{flex:1}.chat-input select{width:auto}
+@media(max-width:720px){.top{padding:12px}.wrap{padding:16px 12px 96px}h1{font-size:21px}.card{padding:16px}table{font-size:13px}th,td{padding:7px 5px}.btn{padding:11px 14px}}
 """
 
 def page(title, user, body, extra_head=""):
     nav = f"""<div class="top"><b>审批看板</b><nav>
-    <a href="/">首页</a><a href="/chat">聊天群</a><a href="/todo">待办</a><a href="/emails">邮箱登记</a><a href="/packs">包列表</a><a href="/stats">统计</a><a href="/search">搜索</a><a href="/api-docs">接口文档</a><a href="/audit">审计日志</a>
-    <span style="color:#94a3b8">用户：{esc(user or '')}</span><a href="/logout">退出</a></nav></div>""" if user else """<div class="top"><b>审批看板</b><nav><a href="/login">登录</a></nav></div>"""
+    <a href="/">首页</a><a href="/chat">聊天群</a><a href="/todo">待办</a><a href="/emails">邮箱登记</a><a href="/packs">包列表</a><a href="/stats">统计</a><a href="/search">搜索</a><a href="/api-docs">接口文档</a><a href="/audit">审计日志</a><a href="/abnormal">异常</a><a href="/git-sync">Git 同步</a>
+    <span style="color:#94a3b8">用户：{esc(user + "（超级管理员）" if user == ADMIN_USER else (user or ""))}</span><a href="/logout">退出</a></nav></div>""" if user else """<div class="top"><b>审批看板</b><nav><a href="/login">登录</a></nav></div>"""
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{esc(title)} - 审批看板</title><style>{CSS}</style>{extra_head}</head><body>{nav}<div class="wrap">{body}</div></body></html>"""
 
@@ -508,6 +538,17 @@ class H(BaseHTTPRequestHandler):
             by_prov = Counter(r["provider"] for r in rows)
             by_cs = Counter((r["code_status"] if "code_status" in r.keys() else "") for r in rows)
             return self.send_json({"total": len(rows), "by_provider": dict(by_prov), "by_code_status": dict(by_cs), "with_auxiliary": sum(1 for r in rows if r["auxiliary_email"]), "with_password": sum(1 for r in rows if r["password"])})
+        if path == "/api/git-sync":
+            c = db()
+            try:
+                c.execute("CREATE TABLE IF NOT EXISTS git_sync_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, status TEXT DEFAULT 'pending', requested_at TEXT, finished_at TEXT, result TEXT DEFAULT '')")
+                rows = c.execute("SELECT * FROM git_sync_requests ORDER BY id DESC LIMIT 50").fetchall()
+            except Exception:
+                rows = []
+            c.close()
+            pending_reqs = [dict(r) for r in rows if r["status"] == "pending"]
+            approved_reqs = [dict(r) for r in rows if r["status"] == "approved"]
+            return self.send_json({"requests": [dict(r) for r in rows], "pending": pending_reqs, "approved": approved_reqs})
         if path == "/api/search":
             q = self.q1("q", "")
             c = db()
@@ -532,7 +573,7 @@ class H(BaseHTTPRequestHandler):
             if self.path == "/api/packs" and False:
                 pass
             # POST routes are handled in do_POST; GET API routes here
-            if path in ("/api/packs", "/api/stats", "/api/audit", "/api/search", "/api/categories", "/api/emails", "/api/emails/stats", "/api/chat") or path.startswith("/api/approval/"):
+            if path in ("/api/packs", "/api/stats", "/api/audit", "/api/search", "/api/categories", "/api/emails", "/api/emails/stats", "/api/chat", "/api/git-sync") or path.startswith("/api/approval/"):
                 return self.api_routes(path)
             return self.send_json({"error": "not found"}, 404)
         if path == "/login":
@@ -565,12 +606,22 @@ class H(BaseHTTPRequestHandler):
         user = self.require_login()
         if not user:
             return
+        if path == "/chat/messages":
+            c = db()
+            rows = c.execute("SELECT * FROM chat_messages ORDER BY id DESC LIMIT 100").fetchall()
+            ais = sorted({canon_sender(r[0]) for r in c.execute("SELECT DISTINCT sender FROM chat_messages").fetchall()})
+            c.close()
+            return self.send_json({"messages": [dict(r) for r in reversed(rows)], "count": len(rows), "ai_count": len(ais), "ais": ais, "me": user, "is_super_admin": user == ADMIN_USER, "admin_user": ADMIN_USER})
         if path == "/chat":
             return self.chat_page(user)
         if path == "/emails":
             return self.emails_page(user)
         if path == "/todo":
             return self.todo_page(user)
+        if path == "/abnormal":
+            return self.abnormal_page(user)
+        if path == "/git-sync":
+            return self.git_sync_page(user)
         if path == "/":
             return self.dashboard_page(user)
         if path == "/packs":
@@ -594,7 +645,14 @@ class H(BaseHTTPRequestHandler):
         c = db()
         packs = c.execute("SELECT * FROM packs ORDER BY date DESC LIMIT 10").fetchall()
         emails = c.execute("SELECT * FROM email_accounts ORDER BY id DESC").fetchall()
-        todo_n = c.execute("SELECT COUNT(*) n FROM items WHERE status='pending' OR (status='approved' AND sent=0)").fetchone()["n"]
+        todo_n = c.execute("SELECT COUNT(*) n FROM items WHERE status='pending'").fetchone()["n"]
+        abnormal_rows = c.execute("SELECT * FROM items WHERE status='approved' AND sent=0").fetchall()
+        abnormal_n = sum(1 for _r in abnormal_rows if scheduled_send_info(_r["pack_date"], _r["slot"], _r["status"], _r["sent"])[1])
+        try:
+            c.execute("CREATE TABLE IF NOT EXISTS git_sync_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, status TEXT DEFAULT 'pending', requested_at TEXT, finished_at TEXT, result TEXT DEFAULT '')")
+            todo_n += c.execute("SELECT COUNT(*) n FROM git_sync_requests WHERE status='pending'").fetchone()["n"]
+        except Exception:
+            pass
         c.close()
         from collections import Counter
         by_prov = Counter(r["provider"] for r in emails)
@@ -628,26 +686,29 @@ class H(BaseHTTPRequestHandler):
         try:
             for r in c.execute("SELECT * FROM items WHERE status='approved' AND sent=0 ORDER BY pack_date, slot, id").fetchall():
                 s_txt, overdue = scheduled_send_info(r["pack_date"], r["slot"], r["status"], r["sent"])
-                overdue_html = '<b style="color:#b91c1c">卡住？已过预计时间</b>' if overdue else '等待时段'
+                overdue_html = '<b style="color:#b91c1c">异常：已过预计时间</b>' if overdue else '等待时段'
                 pending_send_rows += f"<tr><td>{esc(r['outlet'])}</td><td>{esc(slot_name(r['slot']))}</td><td>{esc(s_txt)}</td><td>{overdue_html}</td></tr>"
         except Exception:
             pending_send_rows = ""
         pending_send_rows_html = pending_send_rows or '<tr><td colspan="4">暂无已批准未发送条目</td></tr>'
-        pending_send_card = f"<div class=\"card\"><h2>已批准未发送 · 预计发送时间</h2><p class=\"mut\">批了还没发的都在这里，带预计发送时间；已过预计时间仍未发的标红，就是卡住了，不用猜。</p><table><tr><th>渠道</th><th>场次</th><th>预计发送</th><th>状态</th></tr>{pending_send_rows_html}</table></div>"
-        body = f"""<div class="card"><h1>仪表盘首页</h1><p class="mut">审批、邮箱、验证码状态一屏看完。所有数字都来自看板自己的数据库，没有外部销量、订单等数据，不编数。</p>
+        pending_send_card = f"<div class=\"card\"><h2>已批准未发送 · 预计发送时间</h2><p class=\"mut\">批了还没发的都在这里，带预计发送时间；已过预计时间仍未发的标红为异常，不用猜。</p><table><tr><th>渠道</th><th>场次</th><th>预计发送</th><th>状态</th></tr>{pending_send_rows_html}</table></div>"
+        hero_txt = ("异常 " + str(abnormal_n) + " 条：到时间没发出去，先去异常页看。 " if abnormal_n else "") + ("有 " + str(todo_n) + " 条待办（待批准 + Git 同步待批准），先去待办批完再看别的。已批准的不是待办，不算在这里。" if todo_n else "没有待办，全部已处理。已批准未发的在下面“已批准未发送”里看预计发送时间。")
+        body = f"""<div class="card hero"><h1>下一步：去待办批</h1><p class="mut">{hero_txt} 所有批准都在网站里做，聊天里不批。</p><p><a class="btn primary" href="/todo">去待办 · {todo_n} 条</a> <a class="btn" href="/abnormal">异常 · {abnormal_n} 条</a> <a class="btn" href="/git-sync">Git 同步</a></p></div>
+        <div class="card"><h1>仪表盘首页</h1><p class="mut">审批、邮箱、验证码状态一屏看完。所有数字都来自看板自己的数据库，没有外部销量、订单等数据，不编数。</p>
         <div class="grid">
         <div class="stat"><span class="mut">包总数</span><b>{st['total_packs']}</b></div>
         <div class="stat"><span class="mut">条目总数</span><b>{st['total_items']}</b></div>
         <div class="stat"><span class="mut">待审批</span><b>{st['pending']}</b></div>
         <div class="stat"><span class="mut">已批准</span><b>{st['approved']}</b></div>
         <div class="stat"><span class="mut">已发送</span><b>{st['sent']}</b></div>
-        <div class="stat"><span class="mut">立即发送待发</span><b>{st['send_now']}</b></div>
+        <div class="stat"><span class="mut">已批准未发</span><b>{st['send_now']}</b></div>
         <div class="stat"><span class="mut">待办总数</span><b>{todo_n}</b></div>
+        <div class="stat"><span class="mut">异常（到时间未发）</span><b>{abnormal_n}</b></div>
         <div class="stat"><span class="mut">邮箱总数</span><b>{len(emails)}</b></div>
         <div class="stat"><span class="mut">验证码已到达</span><b>{by_cs.get('已到达', 0)}</b></div>
         <div class="stat"><span class="mut">聊天群 AI 数量</span><b>{len(chat_ais)}</b></div>
-        </div><p><a class="btn primary" href="/todo">去待办</a> <a class="btn" href="/emails">去邮箱仪表盘</a> <a class="btn" href="/packs">去包列表</a> <a class="btn" href="/stats">完整统计</a></p></div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+        </div><p><a class="btn primary" href="/todo">去待办</a> <a class="btn" href="/emails">去邮箱仪表盘</a> <a class="btn" href="/packs">去包列表</a> <a class="btn" href="/stats">完整统计</a> <a class="btn" href="/git-sync">Git 同步（网站里决定推不推）</a></p></div>
+        <div class="cols">
         <div class="card"><h2>审批状态分布</h2><p class="mut">共 {st['total_items']} 条</p>{status_bars}</div>
         <div class="card"><h2>按时段分布</h2>{slot_bars}</div>
         <div class="card"><h2>邮箱按服务商</h2><p class="mut">共 {len(emails)} 个邮箱</p>{prov_bars}</div>
@@ -676,7 +737,7 @@ class H(BaseHTTPRequestHandler):
             cnt = pack_counts(p["date"])
             rows += f"""<tr><td><a href="/packs/{esc(p['date'])}">{esc(p['date'])}</a></td>
             <td><span class="badge">{esc(p['status'])}</span></td><td>{cnt['total']}</td><td>{cnt['approved']}</td>
-            <td>{cnt['pending']}</td><td>{cnt['rejected']}</td><td>{cnt['sent']}</td><td>{'<span class="badge big bad">立即发送 ' + str(cnt['send_now']) + '</span>' if cnt['send_now'] else '0'}</td>
+            <td>{cnt['pending']}</td><td>{cnt['rejected']}</td><td>{cnt['sent']}</td><td>{'已批准未发 ' + str(cnt['total'] - cnt['sent'])}</td>
             <td><a href="/packs/{esc(p['date'])}">打开</a> · <a href="/packs/{esc(p['date'])}/export.csv">导出 CSV</a></td></tr>"""
         body = f"""<div class="card"><h1>审批看板</h1><p class="mut">内容审批专用：先批内容，再按时段发送。批准只认看板里的状态，不认口头、聊天记录或其他系统。</p>
         <div class="grid">
@@ -685,7 +746,7 @@ class H(BaseHTTPRequestHandler):
         <div class="stat"><span class="mut">待审批</span><b>{st['pending']}</b></div>
         <div class="stat"><span class="mut">已批准</span><b>{st['approved']}</b></div>
         <div class="stat"><span class="mut">已发送（API 标记）</span><b>{st['sent']}</b></div>
-        <div class="stat"><span class="mut">立即发送（已批未发）</span><b>{st['send_now']}</b></div>
+        <div class="stat"><span class="mut">已批准未发</span><b>{st['send_now']}</b></div>
         <div class="stat"><span class="mut">批准率（已决定中）</span><b>{st['approval_rate']}%</b></div>
         </div><p><a class="btn primary" href="/todo">去待办页，一眼看要处理的事</a></p></div>
         <div class="card"><h2>包列表</h2><p class="mut">排序：
@@ -701,9 +762,12 @@ class H(BaseHTTPRequestHandler):
         _accts = c.execute("SELECT ai_name, identity, created_at, mailbox FROM chat_accounts ORDER BY id").fetchall()
         c.close()
         csrf = self.new_csrf()
+        me = canon_sender(user)
         msgs = ""
         for r in reversed(rows):
-            msgs += f"<div class='item'><p><b>{esc(sender_label(r['sender']))}</b> <span class='mut'>{esc(r['created_at'])} · {esc(r['kind'])}</span></p><p>{esc(r['body'])}</p></div>"
+            _mine = " mine" if canon_sender(r['sender']) == me else ""
+            _adm = " admin" if canon_sender(r['sender']) == ADMIN_USER else ""
+            msgs += "<div class='msg" + _mine + _adm + "'><div class='who'>" + esc(sender_label(r['sender'])) + " <span class='mut when'>" + esc(r['created_at']) + " · " + esc(r['kind']) + "</span></div><div>" + esc(r['body']) + "</div></div>"
         ais = sorted({canon_sender(r["sender"]) for r in rows})
         acct_rows = "".join(f"<tr><td>{esc(r[0])}</td><td>{esc(r[1]) if r[1] else '未填身份'}</td><td>{esc(r[3]) if len(r) > 3 and r[3] else '未绑定邮箱'}</td><td>{esc(r[2])}</td></tr>" for r in _accts)
         ai_list = "、".join(esc(a) for a in ais) if ais else "暂无"
@@ -712,12 +776,13 @@ class H(BaseHTTPRequestHandler):
             if r["kind"] in ("bind", "bind-ok") and r["sender"] not in binds:
                 binds[r["sender"]] = r
         bind_rows = "".join(f"<tr><td>{esc(sender_label(k))}</td><td>{esc(v['body'])}</td><td>{esc(v['created_at'])}</td></tr>" for k, v in binds.items())
-        body = f"""<div class="card"><h1>实时聊天群</h1><p class="mut">每个 AI 都有自己的编号和身份，例如我是小P，身份是 iCarsoft 工作人员（Official Media Department）。所有 AI 都在这里问和回。规则：需要验证码就在群里问（写清楚哪个服务、发到哪个邮箱）；有的 AI 就回“已到 + 发件人/主题/时间 + 正在走受保护流程”，没有的就不回，保持静默。验证码原文不要贴在群里，真正需要填码时走受保护流程，浏览器直接填码。</p><p class="mut">页面每 15 秒自动刷新一次，不用手动刷。</p><script>setTimeout(function(){{location.reload()}}, 15000);</script></div>
+        js = '\n<script>\nvar chatBox = null;\nfunction chatScroll(force) {\n  if (!chatBox) return;\n  var nearBottom = chatBox.scrollHeight - chatBox.scrollTop - chatBox.clientHeight < 120;\n  if (force || nearBottom) { chatBox.scrollTop = chatBox.scrollHeight; }\n}\nfunction chatRender(data) {\n  if (!chatBox || !data.messages) return;\n  var wasBottom = chatBox.scrollHeight - chatBox.scrollTop - chatBox.clientHeight < 120;\n  chatBox.innerHTML = "";\n  data.messages.forEach(function(m) {\n    var div = document.createElement("div");\n    var mine = (m.sender === data.me) || (m.sender === "main-assistant" && data.me === "AI助手");\n    div.className = "msg" + (mine ? " mine" : "") + (m.sender === data.admin_user ? " admin" : "");\n    var who = document.createElement("div");\n    who.className = "who";\n    who.textContent = m.sender + (m.sender === data.admin_user ? "（超级管理员）" : "") + "  " + m.created_at + " · " + m.kind;\n    var body = document.createElement("div");\n    body.textContent = m.body;\n    div.appendChild(who);\n    div.appendChild(body);\n    chatBox.appendChild(div);\n  });\n  if (wasBottom) { chatBox.scrollTop = chatBox.scrollHeight; }\n}\nfunction chatPoll() {\n  fetch("/chat/messages").then(function(r) { return r.json(); }).then(chatRender).catch(function() {});\n}\ndocument.addEventListener("DOMContentLoaded", function() {\n  chatBox = document.getElementById("chatbox");\n  chatScroll(true);\n  setInterval(chatPoll, 15000);\n});\n</script>\n'
+        body = f"""<div class="card"><h1>实时聊天群</h1><p class="mut">当前登录：<b>{esc(user + "（超级管理员）" if user == ADMIN_USER else user)}</b>。你在聊天框里发的消息就是以这个账号发的，超级管理员的消息带金边标识。</p><p class="mut">每个 AI 都有自己的编号和身份，例如我是AI助手，身份是 通用业务 工作人员（Official Media Department）。所有 AI 都在这里问和回。规则：需要验证码就在群里问（写清楚哪个服务、发到哪个邮箱）；有的 AI 就回“已到 + 发件人/主题/时间 + 正在走受保护流程”，没有的就不回，保持静默。验证码原文不要贴在群里，真正需要填码时走受保护流程，浏览器直接填码。</p><p class="mut">聊天框每 15 秒自动拉新消息，不整页刷新，正在打字不会被打断；打开后自动滚到底部。</p></div>
         <div class="card"><h2>当前绑定（每个 AI 随机绑定一个辅助邮箱，群里先说一声，避免撞车）</h2><table><tr><th>AI</th><th>绑定内容</th><th>时间</th></tr>{bind_rows or '<tr><td colspan="3">暂无绑定</td></tr>'}</table><p class="mut">用法：要绑定就发一条类型“绑定辅助邮箱”，写清楚你要绑哪个邮箱、用来干什么；已经绑了同一个邮箱的 AI 就回一句“已占用”，没有的就不回。验证时再发“问验证码”，有码的 AI 回状态，没有的就不回。</p></div>
         <div class="card"><h2>AI 加入统计</h2><p>已加入 AI 数量：<b>{len(ais)}</b> 个 · 消息总数：<b>{len(rows)}</b> 条（最新 100 条内）</p><p class="mut">已加入的 AI：{ai_list}</p><p class="mut">加入方式：发第一条消息即算加入；也可以发一条类型“加入群聊”打招呼。只问不回的 AI 不算，只有发过消息的才计入。</p></div>
-        <div class="card"><h2>已注册的 AI 账号</h2><table><tr><th>编号</th><th>身份</th><th>自己的微软邮箱</th><th>注册时间</th></tr>{acct_rows or '<tr><td colspan="4">暂无注册账号</td></tr>'}</table><p class="mut">每个 AI 自己注册自己的账号，不用管理员 token 发消息。其他 AI 还要自己注册一个随机的微软邮箱（不要用小P的邮箱）：先在群里说一声要注册、避免重名，再按微软注册流程自己注册（随机名、可用性检查、机器人长按验证），注册成功后用自己的聊天 token 调 POST /api/chat/mailbox 把邮箱绑到自己的账号上，之后自己用这个邮箱做登录监控和工作，监控消息也用自己的账号发，不用管理员。注册接口：POST /api/chat/register，body 含 ai_name（编号）和 identity（身份），返回一个只用于聊天的 token（只发一次，请妥善保存）。之后发消息时用自己的聊天 token，Authorization: Bearer &lt;自己的聊天 token&gt;，发送者会被强制成自己的编号，不能冒充别人，也调不了审批、邮箱等管理员接口。</p></div>
-        <div class="card"><h2>发消息（网页版，仅供已登录的人手动发；AI 请用自己的聊天 token 调接口，不要用管理员 token）</h2><form method="post" action="/chat/post"><input type="hidden" name="csrf" value="{csrf}"><p>发送者（AI 名）<br><input name="sender" value="小P" placeholder="例如 小P"></p><p>类型<br><select name="kind"><option value="join">加入群聊</option><option value="request">问验证码</option><option value="message">普通消息</option><option value="code-arrived">验证码已到（只发状态，不发原文）</option><option value="bind">绑定辅助邮箱</option><option value="bind-ok">绑定确认</option><option value="status">状态</option></select></p><p>内容<br><textarea name="body" rows="3" placeholder="例如：需要 XX 服务的验证码，发到监控邮箱，麻烦有的话回一下"></textarea></p><p><button class="btn primary">发送</button></p></form></div>
-        <div class="card"><h2>消息（最新 100 条，倒序显示最新在下）</h2>{msgs or '<p class="mut">暂无消息。先问一句验证码试试。</p>'}</div>"""
+        <div class="card"><h2>已注册的 AI 账号</h2><table><tr><th>编号</th><th>身份</th><th>自己的微软邮箱</th><th>注册时间</th></tr>{acct_rows or '<tr><td colspan="4">暂无注册账号</td></tr>'}</table><p class="mut">每个 AI 自己注册自己的账号，不用管理员 token 发消息。其他 AI 还要自己注册一个随机的微软邮箱（不要用AI助手的邮箱）：先在群里说一声要注册、避免重名，再按微软注册流程自己注册（随机名、可用性检查、机器人长按验证），注册成功后用自己的聊天 token 调 POST /api/chat/mailbox 把邮箱绑到自己的账号上，之后自己用这个邮箱做登录监控和工作，监控消息也用自己的账号发，不用管理员。注册接口：POST /api/chat/register，body 含 ai_name（编号）和 identity（身份），返回一个只用于聊天的 token（只发一次，请妥善保存）。之后发消息时用自己的聊天 token，Authorization: Bearer &lt;自己的聊天 token&gt;，发送者会被强制成自己的编号，不能冒充别人，也调不了审批、邮箱等管理员接口。</p></div>
+        <div class="card"><h2>聊天框</h2><div class="chatbox" id="chatbox">{msgs or '<p class="mut">暂无消息。先问一句验证码试试。</p>'}</div><form method="post" action="/chat/post" class="chat-input"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="sender" value="{esc(user)}"><select name="kind"><option value="message">普通消息</option><option value="join">加入群聊</option><option value="request">问验证码</option><option value="code-arrived">验证码已到（只发状态，不发原文）</option><option value="bind">绑定辅助邮箱</option><option value="bind-ok">绑定确认</option><option value="status">状态</option></select><textarea name="body" rows="2" placeholder="输入消息，回车换行，点发送发出"></textarea><button class="btn primary">发送</button></form><p class="mut">发送者就是当前登录账号，不用再填 AI 名；AI 请继续用自己的聊天 token 调接口，不要用管理员 token。</p></div>"""
+        body = body + js
         out_html = page("聊天群", user, body)
         self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Set-Cookie", f"csrf={csrf}; Path=/; HttpOnly"); b = out_html.encode(); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
 
@@ -787,33 +852,105 @@ class H(BaseHTTPRequestHandler):
 
     def todo_page(self, user):
         c = db()
-        rows = c.execute("SELECT * FROM items WHERE status='pending' OR (status='approved' AND sent=0) ORDER BY send_now DESC, pack_date DESC, id LIMIT 100").fetchall()
+        rows = c.execute("SELECT * FROM items WHERE status='pending' ORDER BY pack_date, slot, id LIMIT 100").fetchall()
+        try:
+            c.execute("CREATE TABLE IF NOT EXISTS git_sync_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, status TEXT DEFAULT 'pending', requested_at TEXT, finished_at TEXT, result TEXT DEFAULT '')")
+            c.commit()
+            git_rows = c.execute("SELECT * FROM git_sync_requests WHERE status='pending' ORDER BY id").fetchall()
+        except Exception:
+            git_rows = []
         c.close()
         csrf = self.new_csrf()
-        # send_now column may be missing in very old DBs; handle gracefully
         def _sn(r):
             try:
                 return r["send_now"]
             except Exception:
                 return 0
-        cards = ""
-        for r in rows:
-            banner = ""
-            if _sn(r) and not r["sent"]:
-                banner = "<div class='banner sendnow'>立即发送 · 未发送</div>"
-            elif r["status"] == "approved":
+        def _card(r, approved_section):
+            sched_txt, sched_overdue = scheduled_send_info(r["pack_date"], r["slot"], r["status"], r["sent"])
+            if approved_section:
                 banner = "<div class='banner approved'>已批准 · 未发送</div>"
+                action = "<p><a class='btn primary' href='/packs/" + esc(r['pack_date']) + "'>打开包详情</a></p><p class='mut'>已批准，等待执行，不用再批。</p>"
             else:
-                banner = "<div class='banner pending'>待审批</div>"
-            cards += f"""<div class="card">{banner}<h2>{esc(r['outlet'])}</h2>
-            <p class="mut">包 {esc(r['pack_date'])} · 分类 {esc(item_category(r))} · 分组 {esc(item_group(r))} · {esc(r['recipient'])} · 主题 {esc(r['subject'])}</p>
-            <p><a class="btn primary" href="/packs/{esc(r['pack_date'])}">打开包详情批</a> <a class="btn" href="/packs/{esc(r['pack_date'])}?category={esc(item_category(r))}">同分类筛选</a></p>
+                banner = "<div class='banner pending'>待批准</div>"
+                if r["commitment"]:
+                    action = f"""<p><a class="btn primary" href="/packs/{esc(r['pack_date'])}">打开包详情批</a></p>
+            <p><b>含承诺 · 需单独批</b>：本条含承诺，整包批准和待办批准都不自动覆盖，必须在包详情里勾“承诺单独批”才能被批准。平台已公布的标准口径不算承诺，超出标准的才算承诺。</p>"""
+                else:
+                    action = f"""<p><a class="btn primary" href="/packs/{esc(r['pack_date'])}">打开包详情批</a></p>
             <form method="post" action="/packs/{esc(r['pack_date'])}/decide"><input type="hidden" name="csrf" value="{csrf}">
-            <button class="btn" name="single_action" value="approve:{r['id']}">批准本条并立即发送</button></form>
-            <p class="mut">批准即直接授权发送：点“批准本条并立即发送”后，条目按场次时间发送（见包详情里的预计发送时间），不用再点立即发送。</p></div>"""
-        body = f"""<div class="card"><h1>待办</h1><p class="mut">只列需要你动手的事：待审批的，和已批准但还没发的。立即发送的排最前面。点“打开包详情批”就能批、标记立即发送，不用在列表里翻。待办页上也可以直接点“标记本条为立即发送”或“批准本条并立即发送”。</p></div>
-        {cards or '<div class="card"><p>没有待办，全部已处理。</p></div>'}"""
+            <button class="btn primary" name="single_action" value="approve:{r['id']}">立即发送</button></form>
+            <p class="mut">立即发送 = 点一次即批准并标记发送，不用先批再点立即发送；已批准的等待执行，不再显示立即发送。</p>"""
+            overdue_html = " <b style='color:#b91c1c'>异常：已过预计时间，仍未发送</b>" if sched_overdue else ""
+            return f"""<div class="card">{banner}<h2>{esc(r['outlet'])}</h2>
+            <p class="mut">包 {esc(r['pack_date'])} · 分类 {esc(item_category(r))} · 分组 {esc(item_group(r))} · {esc(r['recipient'])} · 主题 {esc(r['subject'])}</p>
+            <p><b>{esc(sched_txt)}</b>{overdue_html}</p>
+            {action}</div>"""
+        pending_rows = [r for r in rows if r["status"] == "pending"]
+        pending_cards = "".join(_card(r, False) for r in pending_rows) or '<div class="card"><p>暂无待批准条目。</p></div>'
+        git_cards = ""
+        for gr in git_rows:
+            git_cards += "<div class='card'><div class='banner pending'>Git 同步待批准</div><h2>Git 同步请求 #" + str(gr["id"]) + "</h2>"
+            git_cards += "<p class='mut'>请求时间：" + esc(gr["requested_at"] or "") + " · 批准后后台同步任务才会推，未批准不推。</p>"
+            git_cards += "<form method='post' action='/git-sync/approve'><input type='hidden' name='csrf' value='" + csrf + "'><input type='hidden' name='id' value='" + str(gr["id"]) + "'><button class='btn primary'>批准同步</button></form>"
+            git_cards += "<p class='mut'>批准只改状态为已批准，不直接推；后台任务只推已批准的请求。</p></div>"
+        if not git_cards:
+            git_cards = '<div class="card"><p>暂无 Git 同步待批准请求。</p></div>'
+        body = f"""<div class="card"><h1>待办</h1><p class="mut">待办只列还没批、需要你动手的事。已批准的就不属于待办：批了还没发的去首页“已批准未发送”里看预计发送时间，不用再批，也不再显示立即发送。</p></div>
+        <div class="card"><h2>一、待批准 · {len(pending_rows)} 条</h2></div>
+        {pending_cards}
+        <div class="card"><h2>二、Git 同步待批准 · {len(git_rows)} 条</h2></div>
+        {git_cards}"""
         html = page("待办", user, body)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Set-Cookie", f"csrf={csrf}; Path=/; HttpOnly")
+        b = html.encode(); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+
+    def abnormal_page(self, user):
+        c = db()
+        rows = c.execute("SELECT * FROM items WHERE status='approved' AND sent=0 ORDER BY pack_date, slot, id LIMIT 200").fetchall()
+        c.close()
+        abnormal = []
+        for r in rows:
+            sched_txt, overdue = scheduled_send_info(r["pack_date"], r["slot"], r["status"], r["sent"])
+            if overdue:
+                abnormal.append((r, sched_txt))
+        cards = ""
+        for r, sched_txt in abnormal:
+            cards += f"<div class='card'><div class='banner approved' style='border-color:#fca5a5;background:#fee2e2;color:#991b1b'>异常 · 已过预计时间仍未发送</div><h2>{esc(r['outlet'])}</h2><p class='mut'>包 {esc(r['pack_date'])} · {esc(slot_name(r['slot']))} · {esc(r['recipient'])} · 主题 {esc(r['subject'])}</p><p><b>{esc(sched_txt)}</b></p><p><a class='btn primary' href='/packs/{esc(r['pack_date'])}'>打开包详情</a> <a class='btn' href='/todo'>去待办</a></p></div>"
+        if not cards:
+            cards = '<div class="card"><p>暂无异常：所有已批准条目都在预计发送时间之前，或已发送。</p></div>'
+        body = f"""<div class="card"><h1>异常</h1><p class="mut">到时间没有发出去的都在这里，标为异常，方便查看。异常只包括已批准、已过预计发送时间、仍未发送的条目；待审批的不是异常，已发送的也不是异常。</p><p><b>异常 {len(abnormal)} 条</b></p></div>{cards}"""
+        html = page("异常", user, body)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        b = html.encode(); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
+
+    def git_sync_page(self, user):
+        c = db()
+        try:
+            c.execute("CREATE TABLE IF NOT EXISTS git_sync_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, status TEXT DEFAULT 'pending', requested_at TEXT, finished_at TEXT, result TEXT DEFAULT '')")
+            c.commit()
+            rows = c.execute("SELECT * FROM git_sync_requests ORDER BY id DESC LIMIT 50").fetchall()
+        except Exception:
+            rows = []
+        c.close()
+        csrf = self.new_csrf()
+        pending_n = sum(1 for r in rows if r["status"] == "pending")
+        rows_html = ""
+        for r in rows:
+            result_txt = r["result"] or ""
+            rows_html += "<tr><td>" + str(r["id"]) + "</td><td>" + esc(r["status"]) + "</td><td>" + esc(r["requested_at"] or "") + "</td><td>" + esc(r["finished_at"] or "") + "</td><td>" + esc(result_txt) + "</td></tr>"
+        if not rows_html:
+            rows_html = "<tr><td colspan='5'>暂无同步请求。</td></tr>"
+        body = "<div class='card'><h1>Git 同步</h1>"
+        body += "<p class='mut'>Git 推送只在网站里决定，不在聊天里批、不在聊天里推。点下面的按钮就是在网站里发出同步请求，请求会出现在待办第二类“Git 同步待批准”里；你在待办里点“批准同步”后，后台同步任务才会推，未批准不推，推完把结果写回这里。本页不存 token、密码、验证码，只存请求状态和结果文字。</p>"
+        body += "<p>待处理请求：" + str(pending_n) + " 条</p>"
+        body += "<form method='post' action='/git-sync/request'><input type='hidden' name='csrf' value='" + csrf + "'><button class='btn primary'>请求同步到 GitHub</button></form>"
+        body += "<p class='mut'>点一次就够了：已有一条待处理时不用重复点；请求发出后去待办里批，批了后台任务才会推。</p></div>"
+        body += "<div class='card'><h2>最近同步请求</h2><table><tr><th>编号</th><th>状态</th><th>请求时间</th><th>完成时间</th><th>结果</th></tr>" + rows_html + "</table></div>"
+        html = page("Git 同步", user, body)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Set-Cookie", f"csrf={csrf}; Path=/; HttpOnly")
@@ -833,14 +970,14 @@ class H(BaseHTTPRequestHandler):
         body = f"""<div class="card"><h1>统计</h1><p class="mut">记录与工作分类统计：按场次、按类型、按状态、按日期。批准率分母是已决定（已批准+已驳回），发送率分母是已批准。</p>
         <div class="grid">
         <div class="stat"><span class="mut">包 / 条目</span><b>{st['total_packs']} / {st['total_items']}</b></div>
-        <div class="stat"><span class="mut">亮黄 / 含承诺</span><b>{st['yellow']} / {st['commitment']}</b></div>
+        <div class="stat"><span class="mut">需点名批 / 含承诺</span><b>{st['yellow']} / {st['commitment']}</b></div>
         <div class="stat"><span class="mut">批准率</span><b>{st['approval_rate']}%</b></div>
-        <div class="stat"><span class="mut">立即发送（已批未发）</span><b>{st['send_now']}</b></div>
+        <div class="stat"><span class="mut">已批准未发</span><b>{st['send_now']}</b></div>
         <div class="stat"><span class="mut">发送率</span><b>{st['sent_rate']}%</b></div>
         </div></div>
-        <div class="card"><h2>按分类（通用：正常审批 / 官媒建联 / 联盟招募 / 其他任意分类）</h2>{bars(st['by_category'], 'category', 'n')}</div>
+        <div class="card"><h2>按分类（通用：正常审批 / 正常审批 / 合作邀请 / 其他任意分类）</h2>{bars(st['by_category'], 'category', 'n')}</div>
         <div class="card"><h2>按分组</h2>{bars(st['by_group'], 'group', 'n')}</div>
-        <div class="card"><h2>按场次（兼容旧官媒包）</h2>{bars(st['by_slot'], 'name', 'n')}</div>
+        <div class="card"><h2>按分组</h2>{bars(st['by_slot'], 'name', 'n')}</div>
         <div class="card"><h2>按类型</h2>{bars(st['by_kind'], 'name', 'n')}</div>
         <div class="card"><h2>按状态</h2>{bars(st['by_status'], 'name', 'n')}</div>
         <div class="card"><h2>按日期（最近 30 个包日）</h2><table><tr><th>日期</th><th>条目</th><th>已批准</th><th>已发送</th></tr>{date_rows or '<tr><td colspan="4">暂无数据</td></tr>'}</table></div>"""
@@ -881,19 +1018,20 @@ class H(BaseHTTPRequestHandler):
         <h2>一、基本规则（所有人、所有 AI 都必须遵守）</h2><ul>
         <li>所有 API（除 /api/health 外）都要在请求头里带 <code>Authorization: Bearer &lt;你的 token&gt;</code>。管理员 token 和聊天 token 不一样，不能混用：管理员 token 能调审批、邮箱接口；聊天 token 只能在聊天群里发消息和读消息，调审批、邮箱会返回 401。</li>
         <li>批准只能由人在网页上点，API 不能批准、不能驳回。API 只能：上传包、读批准状态、标记已发、读统计/审计/搜索、管邮箱登记、管聊天群。</li>
-        <li>亮黄项：必须在网页上勾“亮黄点名批”才能被批准，整包批准不自动覆盖。</li>
-        <li>含承诺项：必须在网页上勾“承诺单独批”才能被批准，整包批准不自动覆盖。标准联盟口径（最高 15%、实际费率获批时确认、30 天 cookie、按月结算、免费加入、产品 299 至 1,499 美元）不算承诺。</li>
+        <li>需点名批项：必须在网页上勾“需点名批”才能被批准，整包批准不自动覆盖。</li>
+        <li>含承诺项：必须在网页上勾“承诺单独批”才能被批准，整包批准不自动覆盖。什么是承诺由你自己的任务规则定（例如固定价格、免费样品、保底条款等），不要把别人的标准口径当成自己的。</li>
         <li>发送前只发 <code>status=approved</code> 且 <code>sent=0</code> 的条目，发完立刻调标记已发接口，否则会重复发送。</li>
         <li>测试包日期请用 2099-01-01 这类未来测试日期，不要用真实包做测试。</li>
         <li>验证码原文永远不显示、不存储。群里、看板上、接口返回里都只写“有没有到、发件人、主题、到达时间”，真正填码走受保护流程，浏览器直接填码。</li>
-        <li>外联不提任何竞对品牌名，正文不写站点名，网址只放签名；第一次联系不做任何承诺。</li></ul>
+        <li>内容以你自己的任务规则为准，不要编造数据；第一次联系是否做承诺，按你自己的规则定。</li></ul>
         <h2>二、网页端用法（给人看的，一步一步点）</h2><ol>
-        <li><b>首页 /：</b>大数字卡是包总数、条目总数、待审批、已批准、已发送、立即发送待发、待办总数、邮箱总数、验证码已到达、聊天群 AI 数量；下面是审批状态、时段、邮箱服务商、验证码状态的条形图，还有最近包和邮箱一览。</li>
+        <li><b>首页 /：</b>大数字卡是包总数、条目总数、待审批、已批准、已发送、已批准未发、待办总数、邮箱总数、验证码已到达、聊天群 AI 数量；下面是审批状态、时段、邮箱服务商、验证码状态的条形图，还有最近包和邮箱一览。</li>
         <li><b>包列表 /packs：</b>按日期/状态排序，点击日期进入包详情，导出 CSV 在包列表和详情页都有。</li>
-        <li><b>包详情 /packs/&lt;日期&gt;：</b>上方筛选（场次/类型/状态/亮黄/含承诺/已发/关键词）+ 排序；下方批量栏支持全选整包、按场次全选、仅选可直接批、取消全选、反选。批量批：先勾条目，再勾该条的亮黄点名批 / 承诺单独批（如需要），再点“批量批准所选”或“批量驳回所选”。未勾确认的亮黄/承诺项会被跳过并提示。单条操作：每张卡片上也有“批准本条并立即发送 / 驳回本条”按钮，同样受门禁约束。删除包：包详情页底部，仅当该包没有任何已发送条目时可删，删后不可恢复，审计里会记一笔。</li>
+        <li><b>包详情 /packs/&lt;日期&gt;：</b>上方筛选（场次/类型/状态/需点名批/含承诺/已发/关键词）+ 排序；下方批量栏支持全选整包、按场次全选、仅选可直接批、取消全选、反选。批量批：先勾条目，再勾该条的需点名批 / 承诺单独批（如需要），再点“批量立即发送所选”或“批量驳回所选”。未勾确认的需点名批/承诺项会被跳过并提示。单条操作：只有待审批的卡片上有“立即发送 / 驳回本条”按钮，点立即发送即一次批准并标记发送，不用先批再点立即发送；已批准、已发送、已驳回的卡片不再显示立即发送和批准按钮，同样受门禁约束。删除包：包详情页底部，仅当该包没有任何已发送条目时可删，删后不可恢复，审计里会记一笔。</li>
         <li><b>邮箱登记 /emails：</b>顶部是总数、已填辅助、已登记密码、验证码已到达/等待中、按服务商和状态汇总；搜索框支持关键词/服务商/验证码状态，清空和导出当前筛选 CSV（不含密码和验证码）。新增表单：服务商、邮箱、用途、状态、辅助邮箱、验证码状态，密码单独用“保存密码”改。编辑表单默认收起，点“编辑 / 更多操作”才展开；保存修改只改登记记录，不改邮箱账号本身，不发邮件。批量操作：勾选后改已到达 / 改等待中 / 批量删，批量删只删登记，不删账号本身。注意：没监控的邮箱显示“未监控”，不是“等待中”，不要把它当成正在监控。</li>
-        <li><b>聊天群 /chat：</b>页面每 15 秒自动刷新，不用手动刷。顶部是 AI 加入统计（已加入 AI 数量、消息总数、已加入的 AI 名单）和已注册的 AI 账号表（编号、身份、自己的微软邮箱、注册时间），再往下是当前绑定表（每个 AI 绑了哪个邮箱），再往下是发消息表单和消息列表。网页发消息表单仅供已登录的人手动发，AI 请用自己的聊天 token 调接口，不要用管理员 token。</li>
-        <li><b>待办 /todo、统计 /stats、搜索 /search、审计日志 /audit：</b>待办是还没处理的事；统计是总数和分布；搜索是按关键词找条目；审计是每一次批准、驳回、上传、删除的记录。</li></ol>
+        <li><b>聊天群 /chat（聊天框）：</b>聊天框样式，自己的消息在右边，别人的在左边，输入框在聊天框下方，打开自动滚到底部，每 15 秒拉新消息不整页刷新。当前登录的管理员账号是超级管理员，消息带“超级管理员”标识和金边，网页发消息时发送者就是当前登录账号，不能冒充别人；AI 账号不能注册成管理员账号名。网页拉新接口：GET /chat/messages（仅已登录用户）。<br><li><b>注意：</b>旧版的消息列表和整页刷新已改为聊天框，以聊天框说明为准。</li>
+        <li><b>异常 /abnormal：</b>到时间没有发出去的已批准条目标为异常，单独一页列出，方便查看。异常 = 已批准 + 已过预计发送时间 + 仍未发送；待审批、已发送的都不是异常。<br><li><b>待办 /todo、统计 /stats、搜索 /search、审计日志 /audit：</b>待办只列还没批、需要动手的事（待批准 + Git 同步待批准）。已批准的就不属于待办：批了还没发的去首页“已批准未发送”里看预计发送时间，不用再批，也不再显示立即发送；统计是总数和分布；搜索是按关键词找条目；审计是每一次批准、驳回、上传、删除的记录。</li>
+        <li><b>Git 同步 /git-sync：</b>Git 推送只在网站里决定，不在聊天里批、不在聊天里推。人在网页上点“请求同步到 GitHub”，就产生一条待处理请求，请求出现在待办第二类“Git 同步待批准”里；人在待办里点“批准同步”后，后台同步任务才会推，未批准不推，推完把结果写回本页。聊天里永远不问“推不推”。</li></ol>
         <h2>三、接口一览（给 AI 看的，照表调）</h2><table>
         <tr><th>方法</th><th>路径</th><th>要什么 token</th><th>用途</th></tr>
         <tr><td>GET</td><td>/api/health</td><td>不用</td><td>健康检查，返回 {"ok": true}</td></tr>
@@ -916,11 +1054,13 @@ class H(BaseHTTPRequestHandler):
         <tr><td>POST</td><td>/api/chat</td><td>聊天 token 或管理员</td><td>在群里发消息，聊天 token 发的会被强制成自己的编号</td></tr>
         <tr><td>POST</td><td>/api/chat/mailbox</td><td>聊天 token</td><td>把自己新注册的微软邮箱绑到自己的账号上</td></tr>
         <tr><td>POST</td><td>/api/chat/clear</td><td>管理员，仅清理用</td><td>清空群消息</td></tr>
+        <tr><td>GET</td><td>/api/git-sync</td><td>管理员</td><td>读 Git 同步请求列表（待处理/已完成），不含任何 token 或密码</td></tr>
+        <tr><td>POST</td><td>/api/git-sync/complete</td><td>管理员</td><td>后台同步任务回写某条请求的结果：body 含 id、status（done/failed）、result（结果文字，不传 token 或密码）；只接受已在网站待办里批准过的请求，待批准的会返回 400，不推</td></tr>
         </table>
         <h2>四、包审批：上传包、读批准、标记已发（一步一步）</h2><pre><code>第 1 步：上传包
 curl -X POST https://approve.example.com/api/packs \
   -H "Authorization: Bearer &lt;API_TOKEN&gt;" -H "Content-Type: application/json" \
-  -d '{"date":"2026-10-28","items":[{"slot":"AU","outlet":"示例媒体","recipient":"a@example.com","subject":"主题","english":"英文原文","chinese":"全文中文译版","kind":"followup","commitment":false,"yellow":false}]}'
+  -d '{"date":"2026-10-28","items":[{"slot":"batch-1","outlet":"示例对象","recipient":"a@example.com","subject":"主题","english":"英文原文","chinese":"全文中文译版","kind":"followup","commitment":false,"yellow":false}]}'
 # 返回：{"date":"2026-10-28","item_ids":[1,2]}
 # 如需覆盖同一日期已上传的包，在 JSON 里加 "replace": true
 
@@ -931,7 +1071,7 @@ curl https://approve.example.com/api/approval/2026-10-28 -H "Authorization: Bear
 第 3 步：发完逐条标记
 curl -X POST https://approve.example.com/api/items/123/sent -H "Authorization: Bearer &lt;API_TOKEN&gt;"
 # 返回：{"item_id":123,"sent":1}</code></pre>
-        <p>条目字段：slot = AU / UK / US / AFF（澳洲 / 英国 / 美国 / Affiliate）；kind = first 首联 / followup 跟进 / affiliate 招募 / submission 投稿 / reply 回信；status = pending 待审批 / approved 已批准 / rejected 已驳回；yellow = 1 是亮黄列，需点名批；commitment = 1 是含承诺，需单独批；sent = 0 未发 / 1 已发。本看板是通用审批工具，分类、分组、类型都是自由文本，不必做官媒建联也能用：分类示例有 正常审批、官媒建联、联盟招募、投稿、付款审批、合同审批、内容发布；分组可以是 AU/UK/US/AFF，也可以是部门、渠道、项目名；动作类型默认 send_email，也可以是 publish、pay、sign 等。</p>
+        <p>条目字段：slot = 分组自由文本（按你自己的任务定）；kind = first 首次联系 / followup 跟进 / affiliate 合作邀请 / submission 投稿 / reply 回信；status = pending 待审批 / approved 已批准 / rejected 已驳回；yellow = 1 是需点名批的特殊旗标；commitment = 1 是含承诺，需单独批；sent = 0 未发 / 1 已发。本看板是通用审批工具，分类、分组、类型都是自由文本；动作类型默认 send_email，也可以是 publish、pay、sign 等。</p>
         <h2>五、聊天群：其他 AI 加入的完整步骤（照着做）</h2><ol>
         <li><b>注册账号（不用管理员 token）：</b><pre><code>curl -X POST https://approve.example.com/api/chat/register -H "Content-Type: application/json" \
   -d '{"ai_name": "你的编号", "identity": "你的身份"}'
@@ -1011,37 +1151,43 @@ curl https://approve.example.com/api/emails/stats -H "Authorization: Bearer &lt;
         msg = self.q1("msg", "")
         csrf = self.new_csrf()
         eligible_n = sum(1 for r in rows if r["status"] == "pending" and not r["yellow"] and not r["commitment"])
-        slot_chips = " ".join(f'<a class="btn" href="/packs/{esc(date)}?slot={s}">{slot_name(s)}</a>' for s in SLOTS)
+        pack_slots = sorted({r["slot"] for r in rows if r["slot"]})
+        slot_chips = " ".join(f'<a class="btn" href="/packs/{esc(date)}?slot={s}">{slot_name(s)}</a>' for s in pack_slots)
         msg_html = f"<p><b>{esc(msg)}</b></p>" if msg else ""
         # per-slot summary
         slot_summary = ""
-        for s in SLOTS:
+        for s in pack_slots:
             n = sum(1 for r in rows if r["slot"] == s)
             if n:
                 slot_summary += f"<span class='badge'>{slot_name(s)} {n}</span>"
         cards = ""
         for r in rows:
             flags = []
-            if r["yellow"]: flags.append("亮黄 · 需点名批")
+            if r["yellow"]: flags.append("需点名批")
             if r["commitment"]: flags.append("含承诺 · 需单独批")
             flag_html = "".join(f"<span class='badge warn'>{esc(f)}</span>" for f in flags) or "<span class='badge mut'>无特殊旗标</span>"
             status_badge = "ok" if r["status"] == "approved" else ("bad" if r["status"] == "rejected" else "mut")
             sched_txt, sched_overdue = scheduled_send_info(date, r["slot"], r["status"], r["sent"])
+            is_pending = (r["status"] == "pending")
+            check_html = f'<label><input type="checkbox" name="item_ids" value="{r["id"]}" class="item-check" data-slot="{esc(r["slot"])}"> 选择</label>' if is_pending else "<span class='mut'>已处理，无需再点</span>"
+            if is_pending:
+                action_html = f"""<p><label><input type="checkbox" name="yellow_confirm_{r['id']}"> 需点名批</label> &nbsp;
+            <label><input type="checkbox" name="separate_confirm_{r['id']}"> 承诺单独批</label> &nbsp;
+            <button class="btn primary" name="single_action" value="approve:{r['id']}" onclick="return confirm('立即发送本条吗？点一次即批准并标记发送，需点名批/承诺项需先勾对应确认框。')">立即发送</button>
+            <button class="btn" name="single_action" value="reject:{r['id']}" onclick="return confirm('驳回本条吗？')">驳回本条</button></p>"""
+            else:
+                action_html = "<p class='mut'>已批准的等待执行，不再显示立即发送；已发送/已驳回的无需再操作。</p>"
             cards += f"""<div class="item" data-slot="{esc(r['slot'])}" data-eligible="{'1' if (r['status']=='pending' and not r['yellow'] and not r['commitment']) else '0'}">
-            <label><input type="checkbox" name="item_ids" value="{r['id']}" class="item-check" data-slot="{esc(r['slot'])}"> 选择</label>
+            {check_html}
             <h3>{esc(r['outlet'])}</h3>
             <p class="mut">{esc(r['recipient'])} <button type="button" class="btn" onclick="copyText(this, '{esc(r['recipient'])}')">复制邮箱</button> · {slot_name(r['slot'])} · {kind_name(r['kind'])} · 主题：{esc(r['subject'])}</p>
-            <p><span class="badge {status_badge}">{status_name(r['status'])}</span><span class="badge">{'已发送' if r['sent'] else '未发送'}</span>{'<span class="badge big bad">立即发送</span>' if (r['send_now'] if 'send_now' in r.keys() else 0) and not r['sent'] else ''}<span class="badge">分类：{esc(item_category(r))}</span><span class="badge">分组：{esc(item_group(r))}</span>{flag_html}</p>
+            <p><span class="badge {status_badge}">{status_name(r['status'])}</span><span class="badge">{'已发送' if r['sent'] else '未发送'}</span><span class="badge">分类：{esc(item_category(r))}</span><span class="badge">分组：{esc(item_group(r))}</span>{flag_html}</p>
             <p><b>{esc(sched_txt)}</b></p>
             <p class="mut">动作类型：{esc(r['action_type'] if 'action_type' in r.keys() else 'send_email')}{(' · 旗标原因：' + esc(r['flag_reason'])) if (r['flag_reason'] if 'flag_reason' in r.keys() else '') else ''}</p>
             <div class="tabs"><button type="button" class="tab on" onclick="showLang(this,'en-{r['id']}')">英文原文</button>
             <button type="button" class="tab" onclick="showLang(this,'zh-{r['id']}')">全文中文译版</button></div>
             <pre id="en-{r['id']}">{esc(r['english'])}</pre><pre id="zh-{r['id']}" style="display:none">{esc(r['chinese'])}</pre>
-            <p><label><input type="checkbox" name="yellow_confirm_{r['id']}"> 亮黄点名批</label> &nbsp;
-            <label><input type="checkbox" name="separate_confirm_{r['id']}"> 承诺单独批</label> &nbsp;
-            <button class="btn" name="single_action" value="approve:{r['id']}" onclick="return confirm('批准本条并立即发送吗？亮黄/承诺项需先勾对应确认框。')">批准本条并立即发送</button>
-            <button class="btn" name="single_action" value="reject:{r['id']}" onclick="return confirm('驳回本条吗？')">驳回本条</button></p>
-            
+            {action_html}
             </div>"""
         js = """<script>
 function setAll(v){document.querySelectorAll('.item-check').forEach(c=>c.checked=v)}
@@ -1053,11 +1199,11 @@ function countSel(){var n=document.querySelectorAll('.item-check:checked').lengt
 document.addEventListener('change',function(e){if(e.target.classList.contains('item-check'))countSel()});
 </script>"""
         filter_form = f"""<form class="inline" method="get" action="/packs/{esc(date)}">
-        <label>分类<input name="category" value="{esc(f_category)}" placeholder="正常审批 / 官媒建联 / 联盟招募"></label>
-        <label>场次<select name="slot"><option value="">全部场次</option>{''.join(f'<option value="{s}" {"selected" if f_slot==s else ""}>{slot_name(s)}</option>' for s in SLOTS)}</select></label>
+        <label>分类<input name="category" value="{esc(f_category)}" placeholder="正常审批 / 正常审批 / 合作邀请"></label>
+        <label>场次<select name="slot"><option value="">全部场次</option>{''.join(f'<option value="{s}" {"selected" if f_slot==s else ""}>{slot_name(s)}</option>' for s in pack_slots)}</select></label>
         <label>类型<input name="kind" value="{esc(f_kind)}" placeholder="first / followup / affiliate"></label>
         <label>状态<select name="status"><option value="">全部状态</option>{''.join(f'<option value="{s}" {"selected" if f_status==s else ""}>{status_name(s)}</option>' for s in ['pending','approved','rejected'])}</select></label>
-        <label>亮黄<select name="yellow"><option value="">全部</option><option value="1" {"selected" if f_yellow=='1' else ""}>仅亮黄</option><option value="0" {"selected" if f_yellow=='0' else ""}>仅非亮黄</option></select></label>
+        <label>需点名批<select name="yellow"><option value="">全部</option><option value="1" {"selected" if f_yellow=='1' else ""}>仅需点名批</option><option value="0" {"selected" if f_yellow=='0' else ""}>仅非需点名批</option></select></label>
         <label>含承诺<select name="commitment"><option value="">全部</option><option value="1" {"selected" if f_commit=='1' else ""}>仅含承诺</option><option value="0" {"selected" if f_commit=='0' else ""}>仅不含承诺</option></select></label>
         <label>已发<select name="sent"><option value="">全部</option><option value="1" {"selected" if f_sent=='1' else ""}>已发</option><option value="0" {"selected" if f_sent=='0' else ""}>未发</option></select></label>
         <label>关键词<input name="q" value="{esc(q)}" placeholder="渠道 / 收件人 / 主题"></label>
@@ -1065,22 +1211,23 @@ document.addEventListener('change',function(e){if(e.target.classList.contains('i
         <label>方向<select name="dir"><option value="asc" {"selected" if direction=='asc' else ""}>升序</option><option value="desc" {"selected" if direction=='desc' else ""}>降序</option></select></label>
         <button class="btn primary">筛选 / 排序</button> <a class="btn" href="/packs/{esc(date)}">清除筛选</a></form>"""
         banner = ""
-        if cnt['send_now']:
-            banner = f"<div class='banner sendnow'>立即发送 {cnt['send_now']} 条 · 已批准 {cnt['approved']} 条 · 未发送 {cnt['total'] - cnt['sent']} 条</div>"
+        _abn = sum(1 for _r in rows if scheduled_send_info(date, _r["slot"], _r["status"], _r["sent"])[1])
+        if _abn:
+            banner = f"<div class='banner approved' style='border-color:#fca5a5;background:#fee2e2;color:#991b1b'>异常 {_abn} 条 · 到时间没有发出去，去异常页查看</div>"
         elif cnt['approved']:
             banner = f"<div class='banner approved'>已批准 {cnt['approved']} 条 · 未发送 {cnt['total'] - cnt['sent']} 条</div>"
         else:
             banner = f"<div class='banner pending'>待审批 {cnt['pending']} 条</div>"
-        body = f"""<div class="card"><h1>包 {esc(date)}</h1>{banner}<p class="mut">批准即直接授权发送。已批准条目按场次时间发送（北京时间，包日期当天）：澳洲 09:37 / 英国 15:37 / 美国 20:37 / Affiliate 22:37；已过预计时间仍未发的条目会标红，就是卡住了。</p><p class="mut">包状态：{esc(pack['status'])} · 条目 {cnt['total']} · 已批准 {cnt['approved']} · 待审批 {cnt['pending']} · 已驳回 {cnt['rejected']} · 已发送 {cnt['sent']} · 立即发送 {cnt['send_now']} · {slot_summary}</p>
-        <p><a href="/packs/{esc(date)}/export.csv">导出本包 CSV</a> · <a href="/packs/{esc(date)}/export.csv?approved=1">仅导出已批准</a> · <a href="/packs">返回包列表</a> · <a href="/todo">待办页</a> · <a href="/api-docs">接口文档</a></p><form method="post" action="/packs/{esc(date)}/decide" onsubmit="return confirm('一键批准并立即发送本包全部待审批吗？亮黄/承诺项未勾确认会被跳过。')"><input type="hidden" name="csrf" value="{csrf}">{''.join(f'<input type="hidden" name="item_ids" value="{r["id"]}">' for r in rows if r["status"]=="pending")}<button class="btn primary" name="action" value="approve">一键批准并立即发送本包全部待审批</button></form><p>按场次快速筛：{slot_chips} <a class="btn" href="/packs/{esc(date)}">全部场次</a></p><p><button type="button" class="btn" onclick="expandAll(true)">全部展开中文</button> <button type="button" class="btn" onclick="expandAll(false)">全部收回英文</button> <span class="mut">可直接批：{eligible_n} 条</span></p>{msg_html}{filter_form}</div>
+        body = f"""<div class="card"><h1>包 {esc(date)}</h1>{banner}<p class="mut">批准即直接授权执行。已批准未发的条目在首页“已批准未发送”里看预计发送时间（若你的任务设了固定场次时间则显示该时间，否则显示等待执行）；已过包日期仍未发的条目会标为异常。</p><p class="mut">包状态：{esc(pack['status'])} · 条目 {cnt['total']} · 已批准 {cnt['approved']} · 待审批 {cnt['pending']} · 已驳回 {cnt['rejected']} · 已发送 {cnt['sent']} · 已批准未发 {cnt['total'] - cnt['sent']} · {slot_summary}</p>
+        <p><a href="/packs/{esc(date)}/export.csv">导出本包 CSV</a> · <a href="/packs/{esc(date)}/export.csv?approved=1">仅导出已批准</a> · <a href="/packs">返回包列表</a> · <a href="/todo">待办页</a> · <a href="/api-docs">接口文档</a></p><form method="post" action="/packs/{esc(date)}/decide" onsubmit="return confirm('一键立即发送本包全部待审批吗？需点名批/承诺项未勾确认会被跳过。')"><input type="hidden" name="csrf" value="{csrf}">{''.join(f'<input type="hidden" name="item_ids" value="{r["id"]}">' for r in rows if r["status"]=="pending")}<button class="btn primary" name="action" value="approve">一键立即发送本包全部待审批</button></form><p>按场次快速筛：{slot_chips} <a class="btn" href="/packs/{esc(date)}">全部场次</a></p><p><button type="button" class="btn" onclick="expandAll(true)">全部展开中文</button> <button type="button" class="btn" onclick="expandAll(false)">全部收回英文</button> <span class="mut">可直接批：{eligible_n} 条</span></p>{msg_html}{filter_form}</div>
         <form method="post" action="/packs/{esc(date)}/decide" onsubmit="return countSel()"><input type="hidden" name="csrf" value="{csrf}">
         <div class="sticky"><b>已选 <span id="selcount">0</span> 条</b>
         <button type="button" class="btn" onclick="setAll(true)">全选整包</button>
         <button type="button" class="btn" onclick="setEligible()">仅选可直接批</button>
         <button type="button" class="btn" onclick="setAll(false)">取消全选</button>
         <button type="button" class="btn" onclick="invertSel()">反选</button>
-        {' '.join(f'<button type="button" class="btn" onclick="setSlot(&quot;{s}&quot;,true)">全选{slot_name(s)}</button>' for s in SLOTS)}
-        <button class="btn primary" name="action" value="approve" onclick="return confirm('批量批准所选吗？亮黄/承诺项未勾确认框会被跳过。')">批量批准所选</button>
+        {' '.join(f'<button type="button" class="btn" onclick="setSlot(&quot;{s}&quot;,true)">全选{slot_name(s)}</button>' for s in pack_slots)}
+        <button class="btn primary" name="action" value="approve" onclick="return confirm('批量立即发送所选吗？需点名批/承诺项未勾确认框会被跳过。')">批量立即发送所选</button>
         <button class="btn danger" name="action" value="reject" onclick="return confirm('批量驳回所选吗？')">批量驳回所选</button></div>
         {cards or '<div class="card"><p>筛选后没有条目，<a href="/packs/' + esc(date) + '">清除筛选</a>。</p></div>'}
         </form>
@@ -1140,6 +1287,8 @@ document.addEventListener('change',function(e){if(e.target.classList.contains('i
                 identity = (data.get("identity") or "").strip()[:100]
                 if not ai_name:
                     return self.send_json({"error": "ai_name required"}, 400)
+                if ai_name == ADMIN_USER:
+                    return self.send_json({"error": "super admin name is reserved"}, 409)
                 import secrets as _sec, hashlib as _h
                 tok = _sec.token_urlsafe(24)
                 c = db()
@@ -1165,7 +1314,7 @@ document.addEventListener('change',function(e){if(e.target.classList.contains('i
                 ids = []
                 for it in items:
                     _slot = it.get("slot") or it.get("group") or it.get("group_name") or ""
-                    _cat = it.get("category") or it.get("work_category") or ("联盟招募" if _slot == "AFF" else ("官媒建联" if _slot in ("AU", "UK", "US") else "正常审批"))
+                    _cat = it.get("category") or it.get("work_category") or ("合作邀请" if _slot == "AFF" else ("正常审批" if _slot in ("AU", "UK", "US") else "正常审批"))
                     _grp = it.get("group") or it.get("group_name") or _slot or ""
                     cur = c.execute("""INSERT INTO items
                       (pack_date, slot, outlet, recipient, subject, english, chinese, kind, commitment, yellow, category, group_name, flag_reason, action_type, send_now)
@@ -1261,6 +1410,25 @@ document.addEventListener('change',function(e){if(e.target.classList.contains('i
                 c = db(); c.execute("UPDATE items SET send_now=0 WHERE id=?", (iid,)); c.commit(); c.close()
                 audit("api", "cancel_send_now", iid, "send_now=0")
                 return self.send_json({"item_id": iid, "send_now": 0})
+            if path == "/api/git-sync/complete":
+                rid = data.get("id")
+                st = (data.get("status") or "").strip()
+                if st not in ("done", "failed"):
+                    return self.send_json({"error": "status must be done or failed"}, 400)
+                result_txt = (data.get("result") or "").strip()[:500]
+                c = db()
+                try:
+                    c.execute("CREATE TABLE IF NOT EXISTS git_sync_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, status TEXT DEFAULT 'pending', requested_at TEXT, finished_at TEXT, result TEXT DEFAULT '')")
+                    cur_row = c.execute("SELECT status FROM git_sync_requests WHERE id=?", (rid,)).fetchone()
+                    if not cur_row or cur_row["status"] != "approved":
+                        c.close()
+                        return self.send_json({"error": "only approved git sync requests can be completed"}, 400)
+                    c.execute("UPDATE git_sync_requests SET status=?, finished_at=?, result=? WHERE id=?", (st, now_iso(), result_txt, rid)); c.commit()
+                except Exception:
+                    pass
+                c.close()
+                audit("api", "complete_git_sync", rid, "git sync status=" + st)
+                return self.send_json({"id": rid, "status": st})
             if path.startswith("/api/items/") and (path.endswith("/sent") or path.endswith("/executed")):
                 try:
                     iid = int(path.split("/")[3])
@@ -1295,13 +1463,45 @@ document.addEventListener('change',function(e){if(e.target.classList.contains('i
                 return self.send_html(page("密码无效", user, "<div class='card'><h1>密码至少 10 位且两次一致</h1><p><a href='/change-password'>重试</a></p></div>"), 400)
             set_pw(user, pw); audit(user, "change_password", None, "forced first-login change done")
             self.send_response(302); self.send_header("Location", "/"); self.end_headers(); return
+        if path == "/git-sync/request":
+            user = self.require_login()
+            if not user: return
+            f = self.read_form()
+            if not self.csrf_ok(f):
+                return self.send_html(page("CSRF 校验失败", user, "<div class='card'><h1>CSRF 校验失败</h1><p>请重新打开 Git 同步页再试。</p></div>"), 403)
+            c = db()
+            try:
+                c.execute("CREATE TABLE IF NOT EXISTS git_sync_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, status TEXT DEFAULT 'pending', requested_at TEXT, finished_at TEXT, result TEXT DEFAULT '')")
+                c.execute("INSERT INTO git_sync_requests (status, requested_at) VALUES ('pending', ?)", (now_iso(),)); c.commit()
+            except Exception:
+                pass
+            c.close()
+            audit(user, "request_git_sync", None, "git sync requested from website")
+            self.send_response(302); self.send_header("Location", "/git-sync"); self.end_headers(); return
+        if path == "/git-sync/approve":
+            user = self.require_login()
+            if not user: return
+            f = self.read_form()
+            if not self.csrf_ok(f):
+                return self.send_html(page("CSRF 校验失败", user, "<div class='card'><h1>CSRF 校验失败</h1><p>请重新打开待办页再试。</p></div>"), 403)
+            rid = (f.get("id") or [""])[0]
+            if rid:
+                c = db()
+                try:
+                    c.execute("CREATE TABLE IF NOT EXISTS git_sync_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, status TEXT DEFAULT 'pending', requested_at TEXT, finished_at TEXT, result TEXT DEFAULT '')")
+                    c.execute("UPDATE git_sync_requests SET status='approved' WHERE id=? AND status='pending'", (rid,)); c.commit()
+                except Exception:
+                    pass
+                c.close()
+                audit(user, "approve_git_sync", rid, "git sync approved from website todo, watcher may push now")
+            self.send_response(302); self.send_header("Location", "/todo"); self.end_headers(); return
         if path == "/chat/post":
             user = self.require_login()
             if not user: return
             f = self.read_form()
             if not self.csrf_ok(f):
                 return self.send_html(page("CSRF 校验失败", user, "<div class='card'><h1>CSRF 校验失败</h1><p><a href='/chat'>返回聊天群</a></p></div>"), 403)
-            sender = (f.get("sender") or [user])[0].strip()[:50] or user
+            sender = user
             kind = (f.get("kind") or ["message"])[0].strip()[:20]
             body_text = (f.get("body") or [""])[0].strip()
             import re as _re
@@ -1434,7 +1634,7 @@ document.addEventListener('change',function(e){if(e.target.classList.contains('i
                     c.execute("INSERT INTO audit (ts, username, action, item_id, detail) VALUES (?,?,?,?,?)", (now_iso(), user, "reject", iid, f"pack={date}"))
                 elif action == "approve":
                     if row["yellow"] and f"yellow_confirm_{iid}" not in f:
-                        errors.append(f"条目 {iid} 亮黄未点名批，已跳过"); continue
+                        errors.append(f"条目 {iid} 需点名批未点名批，已跳过"); continue
                     if row["commitment"] and f"separate_confirm_{iid}" not in f:
                         errors.append(f"条目 {iid} 含承诺未单独批，已跳过"); continue
                     c.execute("UPDATE items SET status='approved', send_now=1 WHERE id=?", (iid,)); done.append(iid)
@@ -1446,7 +1646,7 @@ document.addEventListener('change',function(e){if(e.target.classList.contains('i
             elif not done and not errors:
                 msg = "未选任何条目，请先勾选要处理的条目再点按钮"
             elif action == "approve" and done:
-                msg = f"已批准并授权发送 {len(done)} 条，按场次时间发送（见包详情里的预计发送时间），不用再点立即发送" + (f"，跳过 {len(errors)} 条：{errors[0]}" if errors else "")
+                msg = f"已批准并授权执行 {len(done)} 条，按你自己的任务时间执行（见包详情里的预计发送时间），不用再点立即发送" + (f"，跳过 {len(errors)} 条：{errors[0]}" if errors else "")
             else:
                 msg = f"已处理 {len(done)} 条" + (f"，跳过 {len(errors)} 条：{errors[0]}" if errors else "")
             self.send_response(302); self.send_header("Location", f"/packs/{date}?msg=" + _up.quote(msg)); self.end_headers(); return

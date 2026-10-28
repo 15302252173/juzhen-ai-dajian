@@ -1,1 +1,32 @@
-{"date":"2099-01-01","items":[{"action_type":"send_email","category":"正常审批","chinese":"正常审批测试项，仅用于看板测试，切勿发送。","commitment":false,"english":"Dear Test,\n\nThis is a dummy general-approval test item only. Do not send.\n\nBest regards,\nAssistant","group":"客服","kind":"邮件","outlet":"示例客户A","recipient":"test-normal@example.com","subject":"TEST: 正常审批邮件","yellow":false},{"category":"官媒建联","chinese":"官媒测试项，仅用于看板测试，切勿发送。","commitment":false,"english":"Dear Test,\n\nDummy outreach test item only. Do not send.\n\nBest regards,\nAssistant","group":"AU","kind":"followup","outlet":"TEST Outlet AU","recipient":"test-au@example.com","slot":"AU","subject":"TEST: AU followup","yellow":false},{"category":"联盟招募","chinese":"联盟测试项，仅用于看板测试，切勿发送。","commitment":false,"english":"Dear Test,\n\nDummy affiliate test item only. Do not send.\n\nBest regards,\nAssistant","group":"AFF","kind":"affiliate","outlet":"TEST Affiliate","recipient":"test-aff@example.com","slot":"AFF","subject":"TEST: affiliate","yellow":false},{"action_type":"publish","category":"内容发布","chinese":"内容发布测试项，需单独批，切勿发布。","commitment":true,"english":"Dummy publish test item only. Do not publish.","flag_reason":"发布前需单独确认","group":"博客","kind":"发布","outlet":"示例博客","recipient":"","subject":"TEST: 内容发布审批","yellow":false}]}
+{
+  "date": "2099-01-01",
+  "items": [
+    {
+      "action_type": "send_email",
+      "category": "正常审批",
+      "chinese": "正常审批测试项，仅用于看板测试，切勿发送。",
+      "commitment": false,
+      "english": "Dummy general-approval test item only. Do not send.",
+      "group": "客服",
+      "kind": "邮件",
+      "outlet": "示例客户A",
+      "recipient": "test-normal@example.com",
+      "subject": "TEST: 正常审批邮件",
+      "yellow": false
+    },
+    {
+      "action_type": "publish",
+      "category": "内容发布",
+      "chinese": "内容发布测试项，需单独批，切勿发布。",
+      "commitment": true,
+      "english": "Dummy publish test item only. Do not publish.",
+      "flag_reason": "发布前需单独确认",
+      "group": "博客",
+      "kind": "发布",
+      "outlet": "示例博客",
+      "recipient": "",
+      "subject": "TEST: 内容发布审批",
+      "yellow": false
+    }
+  ]
+}
