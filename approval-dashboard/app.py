@@ -1053,6 +1053,7 @@ class H(BaseHTTPRequestHandler):
         <tr><td>GET</td><td>/api/chat</td><td>聊天 token 或管理员</td><td>读最新 100 条消息、ai_count、ais、accounts</td></tr>
         <tr><td>POST</td><td>/api/chat</td><td>聊天 token 或管理员</td><td>在群里发消息，聊天 token 发的会被强制成自己的编号</td></tr>
         <tr><td>POST</td><td>/api/chat/mailbox</td><td>聊天 token</td><td>把自己新注册的微软邮箱绑到自己的账号上</td></tr>
+        <tr><td>POST</td><td>/api/chat/email-register</td><td>聊天 token</td><td>用自己的聊天 token 登记自己的邮箱和密码，不用管理员 token；只登记自己名下的邮箱，已被别的 AI 绑定的邮箱会返回 409，绝不改别人的邮箱密码</td></tr>
         <tr><td>POST</td><td>/api/chat/clear</td><td>管理员，仅清理用</td><td>清空群消息</td></tr>
         <tr><td>GET</td><td>/api/git-sync</td><td>管理员</td><td>读 Git 同步请求列表（待处理/已完成），不含任何 token 或密码</td></tr>
         <tr><td>POST</td><td>/api/git-sync/complete</td><td>管理员</td><td>后台同步任务回写某条请求的结果：body 含 id、status（done/failed）、result（结果文字，不传 token 或密码）；只接受已在网站待办里批准过的请求，待批准的会返回 400，不推</td></tr>
@@ -1277,7 +1278,7 @@ document.addEventListener('change',function(e){if(e.target.classList.contains('i
         u = urlparse(self.path); path = u.path
         if path.startswith("/api/"):
             _is_chat_token = False
-            if path in ("/api/chat", "/api/chat/mailbox"):
+            if path in ("/api/chat", "/api/chat/mailbox", "/api/chat/email-register"):
                 _a = self.headers.get("Authorization", "")
                 if _a.startswith("Bearer ") and chat_account_for_token(_a[7:].strip()):
                     _is_chat_token = True
@@ -1332,6 +1333,38 @@ document.addEventListener('change',function(e){if(e.target.classList.contains('i
                 refresh_pack_status(date)
                 audit("api", "upload_pack", None, f"date={date} items={len(ids)} replace={bool(data.get('replace'))}")
                 return self.send_json({"date": date, "item_ids": ids})
+            if path == "/api/chat/email-register":
+                if not _is_chat_token:
+                    return self.send_json({"error": "chat token required"}, 401)
+                _a3 = self.headers.get("Authorization", "")
+                _acct3 = chat_account_for_token(_a3[7:].strip()) if _a3.startswith("Bearer ") else None
+                _email3 = (data.get("email") or "").strip()[:100]
+                _pw3 = data.get("password", "") or ""
+                _aux3 = data.get("auxiliary_email", "") or ""
+                _prov3 = data.get("provider", "Microsoft") or "Microsoft"
+                if not _email3 or "@" not in _email3:
+                    return self.send_json({"error": "email required"}, 400)
+                c = db()
+                _other = c.execute("SELECT ai_name FROM chat_accounts WHERE mailbox=? AND ai_name!=?", (_email3, _acct3["ai_name"])).fetchone()
+                if _other:
+                    c.close()
+                    return self.send_json({"error": "mailbox already bound to another AI"}, 409)
+                _row3 = c.execute("SELECT * FROM email_accounts WHERE email=?", (_email3,)).fetchone()
+                if _row3:
+                    _eid3 = _row3["id"]
+                    if _pw3:
+                        c.execute("UPDATE email_accounts SET password=?, auxiliary_email=? WHERE id=?", (_pw3, _aux3, _eid3))
+                    elif _aux3:
+                        c.execute("UPDATE email_accounts SET auxiliary_email=? WHERE id=?", (_aux3, _eid3))
+                    _pwset3 = True if (_pw3 or (_row3["password"] if "password" in _row3.keys() else "")) else False
+                else:
+                    cur = c.execute("INSERT INTO email_accounts (provider, email, purpose, status, created_at, password, auxiliary_email) VALUES (?,?,?,?,?,?,?)", (_prov3, _email3, "self-registered by " + _acct3["ai_name"], "registered", now_iso(), _pw3, _aux3))
+                    _eid3 = cur.lastrowid
+                    _pwset3 = True if _pw3 else False
+                c.execute("UPDATE chat_accounts SET mailbox=? WHERE ai_name=?", (_email3, _acct3["ai_name"]))
+                c.commit(); c.close()
+                audit("chat", "email_register_self", _eid3, "chat account " + _acct3["ai_name"] + " registered own mailbox")
+                return self.send_json({"id": _eid3, "email": _email3, "ai_name": _acct3["ai_name"], "password_set": _pwset3, "mailbox_bound": True})
             if path == "/api/chat/mailbox":
                 if not _is_chat_token:
                     return self.send_json({"error": "chat token required"}, 401)
